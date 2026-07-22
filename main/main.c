@@ -3,10 +3,15 @@
  *
  * - ESP32 cria uma rede Wi-Fi própria (Access Point)
  * - Servidor web com 8 botões (6 válvulas + 2 bombas)
- * - Módulo de relé optoacoplado, ativo em LOW
+ * - Módulo de relé optoacoplado, ativo em HIGH
+ * - Leitura de 10 sensores digitais via mux CD74HC4067 / HW-178
+ *   (boias dos tanques, chaves de fluxo, feedback das bombas)
  *
- * Pinos usados (nesta ordem = canal 0 a 7):
- *   GPIO13, GPIO12, GPIO14, GPIO27, GPIO26, GPIO25, GPIO33, GPIO32
+ * Relés (nesta ordem = canal 0 a 7):
+ *   GPIO13, GPIO12, GPIO14, GPIO27, GPIO15, GPIO2, GPIO4, GPI16
+ *
+ * Mux de entrada (S0-S3 + SIG):
+ *   GPIO17, GPIO5, GPIO18, GPIO19, GPIO21
  *
  * ATENÇÃO DE HARDWARE:
  *   GPIO12 é um "strapping pin" do ESP32 (define a tensão da flash no boot).
@@ -26,6 +31,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_rom_sys.h"
 #include "driver/gpio.h"
 
 static const char *TAG = "qqwater";
@@ -47,7 +53,7 @@ static const char *TAG = "qqwater";
 
 static const gpio_num_t relay_pins[NUM_RELAYS] = {
     GPIO_NUM_13, GPIO_NUM_12, GPIO_NUM_14, GPIO_NUM_27,
-    GPIO_NUM_5, GPIO_NUM_17, GPIO_NUM_16, GPIO_NUM_4
+    GPIO_NUM_15, GPIO_NUM_2, GPIO_NUM_4, GPIO_NUM_16
 };
 
 // Ajuste os rótulos conforme a função real de cada canal no seu painel.
@@ -84,6 +90,107 @@ static void relays_init(void)
 }
 
 // ---------------------------------------------------------------------
+// Leitura do multiplexador CD74HC4067 / HW-178 (16 canais)
+// ---------------------------------------------------------------------
+// Pinos de seleção (S0-S3) + SIG. O EN do módulo HW-178 normalmente já
+// vem fixo no GND na própria placa (confirme no seu módulo).
+#define MUX_S0  GPIO_NUM_17
+#define MUX_S1  GPIO_NUM_5
+#define MUX_S2  GPIO_NUM_18
+#define MUX_S3  GPIO_NUM_19
+#define MUX_SIG GPIO_NUM_21
+
+static const gpio_num_t mux_select_pins[4] = { MUX_S0, MUX_S1, MUX_S2, MUX_S3 };
+
+// Canal N do usuário (1-10) = endereço N-1 no mux
+#define NUM_MUX_CHANNELS 10
+
+static const char *mux_labels[NUM_MUX_CHANNELS] = {
+    "Tanque 1 - Alto",
+    "Tanque 1 - Baixo",
+    "Tanque 2 - Alto",
+    "Tanque 2 - Baixo",
+    "Fluxo - Entrada",
+    "Fluxo - Saida",
+    "Fluxo - Purga",
+    "Fluxo - Overpressure",
+    "Bomba 1 - Feedback",
+    "Bomba 2 - Feedback",
+};
+
+// Fiação assumida: cada chave liga o canal ao GND quando ACIONADA, com
+// pull-up interno habilitado no pino SIG. Ou seja, eletricamente:
+//   não acionado -> HIGH (1) | acionado -> LOW (0)
+// Aqui já invertemos para o valor "lógico" ser intuitivo:
+//   mux_state[i] == true  ->  canal ACIONADO (nível alto, chave fechada, etc)
+#define MUX_TRIGGERED_LEVEL 0
+
+static bool mux_state[NUM_MUX_CHANNELS] = {false};
+static int  mux_debounce_count[NUM_MUX_CHANNELS] = {0};
+static bool mux_last_raw[NUM_MUX_CHANNELS] = {false};
+#define MUX_DEBOUNCE_THRESHOLD 3   // leituras iguais seguidas para confirmar mudança
+#define MUX_POLL_PERIOD_MS 50
+
+static void mux_select_channel(int ch)
+{
+    gpio_set_level(MUX_S0, (ch >> 0) & 0x01);
+    gpio_set_level(MUX_S1, (ch >> 1) & 0x01);
+    gpio_set_level(MUX_S2, (ch >> 2) & 0x01);
+    gpio_set_level(MUX_S3, (ch >> 3) & 0x01);
+    esp_rom_delay_us(50); // tempo de acomodação do mux + resistores externos
+}
+
+static void mux_init(void)
+{
+    for (int i = 0; i < 4; i++) {
+        gpio_reset_pin(mux_select_pins[i]);
+        gpio_set_direction(mux_select_pins[i], GPIO_MODE_OUTPUT);
+        gpio_set_level(mux_select_pins[i], 0);
+    }
+
+    gpio_reset_pin(MUX_SIG);
+    gpio_set_direction(MUX_SIG, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(MUX_SIG, GPIO_PULLUP_ONLY);
+
+    ESP_LOGI(TAG, "Mux inicializado (S0=%d S1=%d S2=%d S3=%d SIG=%d)",
+             MUX_S0, MUX_S1, MUX_S2, MUX_S3, MUX_SIG);
+}
+
+// Lê todos os canais uma vez, aplicando debounce simples por contagem
+// de leituras consecutivas iguais antes de aceitar a mudança de estado.
+static void mux_poll_once(void)
+{
+    for (int ch = 0; ch < NUM_MUX_CHANNELS; ch++) {
+        mux_select_channel(ch);
+        int raw_level = gpio_get_level(MUX_SIG);
+        bool raw_triggered = (raw_level == MUX_TRIGGERED_LEVEL);
+
+        if (raw_triggered == mux_last_raw[ch]) {
+            if (mux_debounce_count[ch] < MUX_DEBOUNCE_THRESHOLD) {
+                mux_debounce_count[ch]++;
+            }
+        } else {
+            mux_last_raw[ch] = raw_triggered;
+            mux_debounce_count[ch] = 0;
+        }
+
+        if (mux_debounce_count[ch] >= MUX_DEBOUNCE_THRESHOLD && mux_state[ch] != raw_triggered) {
+            mux_state[ch] = raw_triggered;
+            ESP_LOGI(TAG, "Entrada %d (%s) -> %s", ch, mux_labels[ch],
+                     raw_triggered ? "ACIONADO" : "normal");
+        }
+    }
+}
+
+static void mux_task(void *arg)
+{
+    while (1) {
+        mux_poll_once();
+        vTaskDelay(pdMS_TO_TICKS(MUX_POLL_PERIOD_MS));
+    }
+}
+
+// ---------------------------------------------------------------------
 // Página HTML (embutida no firmware)
 // ---------------------------------------------------------------------
 static const char index_html[] =
@@ -99,15 +206,25 @@ static const char index_html[] =
 "button.on{background:#1f9d55;color:#fff;}"
 "button:active{opacity:.8;}"
 ".status{text-align:center;margin-top:18px;font-size:12px;color:#8ea0b3;}"
+"h2{font-size:14px;color:#8ea0b3;margin:26px auto 10px;max-width:420px;}"
+".inputs{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;max-width:420px;margin:0 auto;}"
+".pill{padding:10px 12px;border-radius:10px;background:#1a232e;font-size:13px;display:flex;"
+"justify-content:space-between;align-items:center;}"
+".dot{width:10px;height:10px;border-radius:50%;background:#555;flex-shrink:0;margin-left:8px;}"
+".dot.on{background:#1f9d55;}"
 "</style></head><body>"
 "<h1>Controle do Poco - qqWater</h1>"
 "<div class='grid' id='grid'></div>"
+"<h2>Sensores (leitura)</h2>"
+"<div class='inputs' id='inputs'></div>"
 "<div class='status' id='status'>conectando...</div>"
 "<script>"
 "const N=8;"
 "const grid=document.getElementById('grid');"
+"const inputsDiv=document.getElementById('inputs');"
 "const st=document.getElementById('status');"
 "let buttons=[];"
+"let pills=[];"
 "for(let i=0;i<N;i++){"
 "  const b=document.createElement('button');"
 "  b.textContent='Canal '+(i+1);"
@@ -128,6 +245,25 @@ static const char index_html[] =
 "      buttons[i].textContent=d.labels[i]+(d.state[i]?' - ON':' - OFF');"
 "      buttons[i].classList.toggle('on',!!d.state[i]);"
 "    }"
+"    if(pills.length===0 && d.in_labels){"
+"      for(let i=0;i<d.in_labels.length;i++){"
+"        const p=document.createElement('div');"
+"        p.className='pill';"
+"        const span=document.createElement('span');"
+"        span.textContent=d.in_labels[i];"
+"        const dot=document.createElement('div');"
+"        dot.className='dot';"
+"        p.appendChild(span);"
+"        p.appendChild(dot);"
+"        inputsDiv.appendChild(p);"
+"        pills.push(dot);"
+"      }"
+"    }"
+"    if(d.in_state){"
+"      for(let i=0;i<d.in_state.length;i++){"
+"        pills[i].classList.toggle('on',!!d.in_state[i]);"
+"      }"
+"    }"
 "    st.textContent='conectado';"
 "  }catch(e){ st.textContent='sem conexao com o ESP32'; }"
 "}"
@@ -146,7 +282,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    char buf[512];
+    char buf[1024];
     int len = snprintf(buf, sizeof(buf), "{\"labels\":[");
     for (int i = 0; i < NUM_RELAYS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "\"%s\"%s",
@@ -156,6 +292,16 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     for (int i = 0; i < NUM_RELAYS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "%d%s",
                          relay_state[i] ? 1 : 0, (i < NUM_RELAYS - 1) ? "," : "");
+    }
+    len += snprintf(buf + len, sizeof(buf) - len, "],\"in_labels\":[");
+    for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
+        len += snprintf(buf + len, sizeof(buf) - len, "\"%s\"%s",
+                         mux_labels[i], (i < NUM_MUX_CHANNELS - 1) ? "," : "");
+    }
+    len += snprintf(buf + len, sizeof(buf) - len, "],\"in_state\":[");
+    for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
+        len += snprintf(buf + len, sizeof(buf) - len, "%d%s",
+                         mux_state[i] ? 1 : 0, (i < NUM_MUX_CHANNELS - 1) ? "," : "");
     }
     len += snprintf(buf + len, sizeof(buf) - len, "]}");
 
@@ -256,8 +402,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Primeiro os relés (todos desligados), depois a rede
+    // Primeiro os relés (todos desligados), depois entradas, rede e servidor
     relays_init();
+    mux_init();
+    xTaskCreate(mux_task, "mux_task", 3072, NULL, 5, NULL);
     wifi_init_softap();
     start_webserver();
 
