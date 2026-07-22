@@ -11,5 +11,7 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\Andre\\Documents\\GitHub\\qqWater\\build"
-  ]
+  ],
+  "idf.portWin": "COM6",
+  "idf.flashType": "UART"
 }
