@@ -1,23 +1,32 @@
 /*
- * qqWater - Controle de válvulas e bombas do poço via ESP32
+ * qqWater - Controle de valvulas e bombas do poco via ESP32
  *
- * - ESP32 cria uma rede Wi-Fi própria (Access Point)
- * - Servidor web com 8 botões (6 válvulas + 2 bombas)
- * - Módulo de relé optoacoplado, ativo em HIGH
+ * - ESP32 cria uma rede Wi-Fi propria (Access Point)
+ * - Captive portal: DNS + redirecionamentos abrem a pagina sozinhos
+ *   ao conectar (igual wifi de aeroporto)
+ * - Servidor web com 8 boteos manuais (bloqueados durante automacao)
+ * - Toggle "Modo Automatico" + botao "Parar Sistema"
+ * - Modulo de rele optoacoplado, ativo em HIGH
  * - Leitura de 10 sensores digitais via mux CD74HC4067 / HW-178
  *   (boias dos tanques, chaves de fluxo, feedback das bombas)
  *
- * Relés (nesta ordem = canal 0 a 7):
- *   GPIO13, GPIO12, GPIO14, GPIO27, GPIO15, GPIO2, GPIO4, GPI16
+ * Reles (nesta ordem = canal 0 a 7):
+ *   GPIO13(V1) GPIO12(V2) GPIO14(V3) GPIO27(V4)
+ *   GPIO15(V5) GPIO2(V6)  GPIO4(B1)  GPIO16(B2)
  *
- * Mux de entrada (S0-S3 + SIG):
- *   GPIO17, GPIO5, GPIO18, GPIO19, GPIO21
+ * Mux de entrada (S0,S1,S2,S3,SIG):
+ *   GPIO21, GPIO19, GPIO18, GPIO5, GPIO17
  *
- * ATENÇÃO DE HARDWARE:
- *   GPIO12 é um "strapping pin" do ESP32 (define a tensão da flash no boot).
- *   Se o módulo de relé mantiver esse pino em HIGH durante o power-on/reset,
- *   o ESP32 pode falhar o boot. Isso é um problema elétrico, não de firmware.
- *   Se notar instabilidade, troque essa ligação para outro GPIO livre.
+ * ATENCAO DE HARDWARE:
+ *   GPIO12, GPIO2, GPIO15 e GPIO5 sao "strapping pins" do ESP32. O que
+ *   mais importa na pratica e o GPIO12 (tensao da flash no boot). Se
+ *   notar boot instavel, ligar um pull-down de 10k entre GPIO12 e GND.
+ *
+ * LOGICA DE AUTOMACAO (maquina de estados):
+ *   Start: abre V1, liga B1, enche T1 -> aguarda 2h -> Ciclo A
+ *   Ciclo A: purga T1 (5min) -> esvazia T1 (V5) -> enche T1 -> aguarda 2h -> Ciclo B
+ *   Ciclo B: purga T2 (5min) -> esvazia T2 (V5) -> enche T2 -> aguarda 2h -> Ciclo A
+ *   Stop: purga T1+T2 (10min) -> esvazia os dois (V5) -> desliga tudo -> Modo Automatico OFF
  */
 
 #include <string.h>
@@ -29,23 +38,26 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "esp_rom_sys.h"
 #include "driver/gpio.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "qqwater";
 
 // ---------------------------------------------------------------------
-// Configuração de rede (Access Point)
+// Configuracao de rede (Access Point)
 // ---------------------------------------------------------------------
 #define AP_SSID       "QQWATER"
-#define AP_PASS       "pocoagua123"   // mínimo 8 caracteres
+#define AP_PASS       "pocoagua123"   // minimo 8 caracteres
 #define AP_CHANNEL    1
 #define AP_MAX_CONN   4
 
 // ---------------------------------------------------------------------
-// Configuração dos relés
+// Configuracao dos reles
 // ---------------------------------------------------------------------
 #define NUM_RELAYS 8
 #define RELAY_ACTIVE_LEVEL 1   // ativo em HIGH
@@ -53,21 +65,28 @@ static const char *TAG = "qqwater";
 
 static const gpio_num_t relay_pins[NUM_RELAYS] = {
     GPIO_NUM_13, GPIO_NUM_12, GPIO_NUM_14, GPIO_NUM_27,
-    GPIO_NUM_15, GPIO_NUM_2, GPIO_NUM_4, GPIO_NUM_16
+    GPIO_NUM_15, GPIO_NUM_2,  GPIO_NUM_4,  GPIO_NUM_16
 };
 
-// Ajuste os rótulos conforme a função real de cada canal no seu painel.
-// Assumindo os 6 primeiros como válvulas e os 2 últimos como bombas.
 static const char *relay_labels[NUM_RELAYS] = {
-    "Valvula 1", "Valvula 2", "Valvula 3", "Valvula 4",
-    "Valvula 5", "Valvula 6", "Bomba 1",   "Bomba 2"
+    "V1 - Entrada T1", "V2 - Entrada T2", "V3 - Saida T1",  "V4 - Saida T2",
+    "V5 - Agua Tratada", "V6 - Purga",    "Bomba 1 (Poco)", "Bomba 2 (Saida)"
 };
 
-// Estado lógico (true = ligado), independente do nível elétrico real
+// Indices para deixar a logica de automacao legivel
+#define IDX_V1 0
+#define IDX_V2 1
+#define IDX_V3 2
+#define IDX_V4 3
+#define IDX_V5 4
+#define IDX_V6 5
+#define IDX_B1 6
+#define IDX_B2 7
+
 static bool relay_state[NUM_RELAYS] = {false};
 
 // ---------------------------------------------------------------------
-// Controle dos relés
+// Controle dos reles
 // ---------------------------------------------------------------------
 static void relay_write(int ch, bool on)
 {
@@ -77,12 +96,18 @@ static void relay_write(int ch, bool on)
     ESP_LOGI(TAG, "Rele %d (%s) -> %s", ch, relay_labels[ch], on ? "LIGADO" : "DESLIGADO");
 }
 
+static void all_relays_off(void)
+{
+    for (int i = 0; i < NUM_RELAYS; i++) {
+        relay_write(i, false);
+    }
+}
+
 static void relays_init(void)
 {
     for (int i = 0; i < NUM_RELAYS; i++) {
         gpio_reset_pin(relay_pins[i]);
         gpio_set_direction(relay_pins[i], GPIO_MODE_OUTPUT);
-        // Garante que todo relé começa DESLIGADO antes de qualquer outra coisa
         gpio_set_level(relay_pins[i], RELAY_INACTIVE_LEVEL);
         relay_state[i] = false;
     }
@@ -92,17 +117,14 @@ static void relays_init(void)
 // ---------------------------------------------------------------------
 // Leitura do multiplexador CD74HC4067 / HW-178 (16 canais)
 // ---------------------------------------------------------------------
-// Pinos de seleção (S0-S3) + SIG. O EN do módulo HW-178 normalmente já
-// vem fixo no GND na própria placa (confirme no seu módulo).
-#define MUX_S0  GPIO_NUM_17
-#define MUX_S1  GPIO_NUM_5
+#define MUX_S0  GPIO_NUM_21
+#define MUX_S1  GPIO_NUM_19
 #define MUX_S2  GPIO_NUM_18
-#define MUX_S3  GPIO_NUM_19
-#define MUX_SIG GPIO_NUM_21
+#define MUX_S3  GPIO_NUM_5
+#define MUX_SIG GPIO_NUM_17
 
 static const gpio_num_t mux_select_pins[4] = { MUX_S0, MUX_S1, MUX_S2, MUX_S3 };
 
-// Canal N do usuário (1-10) = endereço N-1 no mux
 #define NUM_MUX_CHANNELS 10
 
 static const char *mux_labels[NUM_MUX_CHANNELS] = {
@@ -118,17 +140,25 @@ static const char *mux_labels[NUM_MUX_CHANNELS] = {
     "Bomba 2 - Feedback",
 };
 
-// Fiação assumida: cada chave liga o canal ao GND quando ACIONADA, com
-// pull-up interno habilitado no pino SIG. Ou seja, eletricamente:
-//   não acionado -> HIGH (1) | acionado -> LOW (0)
-// Aqui já invertemos para o valor "lógico" ser intuitivo:
-//   mux_state[i] == true  ->  canal ACIONADO (nível alto, chave fechada, etc)
+// Indices para deixar a logica de automacao legivel
+#define MIDX_T1_ALTO 0
+#define MIDX_T1_BAIXO 1
+#define MIDX_T2_ALTO 2
+#define MIDX_T2_BAIXO 3
+#define MIDX_FLUXO_ENTRADA 4
+#define MIDX_FLUXO_SAIDA 5
+#define MIDX_FLUXO_PURGA 6
+#define MIDX_FLUXO_OVERPRESSURE 7
+#define MIDX_BOMBA1_FB 8
+#define MIDX_BOMBA2_FB 9
+
+// Fiacao: cada chave liga o canal ao GND quando ACIONADA, pull-up interno no SIG.
 #define MUX_TRIGGERED_LEVEL 0
 
 static bool mux_state[NUM_MUX_CHANNELS] = {false};
 static int  mux_debounce_count[NUM_MUX_CHANNELS] = {0};
 static bool mux_last_raw[NUM_MUX_CHANNELS] = {false};
-#define MUX_DEBOUNCE_THRESHOLD 3   // leituras iguais seguidas para confirmar mudança
+#define MUX_DEBOUNCE_THRESHOLD 3
 #define MUX_POLL_PERIOD_MS 50
 
 static void mux_select_channel(int ch)
@@ -137,7 +167,7 @@ static void mux_select_channel(int ch)
     gpio_set_level(MUX_S1, (ch >> 1) & 0x01);
     gpio_set_level(MUX_S2, (ch >> 2) & 0x01);
     gpio_set_level(MUX_S3, (ch >> 3) & 0x01);
-    esp_rom_delay_us(50); // tempo de acomodação do mux + resistores externos
+    esp_rom_delay_us(50);
 }
 
 static void mux_init(void)
@@ -156,8 +186,6 @@ static void mux_init(void)
              MUX_S0, MUX_S1, MUX_S2, MUX_S3, MUX_SIG);
 }
 
-// Lê todos os canais uma vez, aplicando debounce simples por contagem
-// de leituras consecutivas iguais antes de aceitar a mudança de estado.
 static void mux_poll_once(void)
 {
     for (int ch = 0; ch < NUM_MUX_CHANNELS; ch++) {
@@ -191,7 +219,543 @@ static void mux_task(void *arg)
 }
 
 // ---------------------------------------------------------------------
-// Página HTML (embutida no firmware)
+// Modo debug: ignora a leitura real do mux e usa valores definidos
+// manualmente pelo app, para testar a automacao sem sensores fisicos.
+// ---------------------------------------------------------------------
+static volatile bool debug_mode = false;
+static volatile bool debug_mux_state[NUM_MUX_CHANNELS] = {false};
+
+static inline bool effective_mux_state(int ch)
+{
+    return debug_mode ? debug_mux_state[ch] : mux_state[ch];
+}
+
+static inline bool tank_high(int tank) { return tank == 1 ? effective_mux_state(MIDX_T1_ALTO) : effective_mux_state(MIDX_T2_ALTO); }
+
+// A boia de fundo (baixo) e do tipo NF/NC: fica fechada (GND) sempre que
+// ha agua acima dela (enchendo, cheio) e SO abre (libera o pull-up, HIGH)
+// quando o tanque esvazia completamente abaixo dela. Ou seja, e o
+// contrario da boia de alto - por isso o sinal e invertido aqui.
+//   alto=HIGH, baixo=HIGH -> vazio        (tank_low = true)
+//   alto=HIGH, baixo=GND  -> enchendo/esvaziando (tank_low = false)
+//   alto=GND,  baixo=GND  -> cheio        (tank_low = false)
+static inline bool tank_low(int tank)  { return tank == 1 ? !effective_mux_state(MIDX_T1_BAIXO) : !effective_mux_state(MIDX_T2_BAIXO); }
+
+// ---------------------------------------------------------------------
+// Automacao (maquina de estados)
+// ---------------------------------------------------------------------
+// Flags de sensores ainda nao instalados. Mude para true quando ligar
+// fisicamente a chave correspondente - a logica ja esta pronta.
+#define FLOW_ENTRADA_INSTALLED   false
+#define OVERPRESSURE_INSTALLED   false
+
+#define DECANT_MS        (50LL * 60 * 1000)   // tempo minimo de decantacao, fixo
+#define MIN_PURGE_MIN 1
+#define MAX_PURGE_MIN 60
+#define STOP_WATCHDOG_MS (30LL * 60 * 1000)   // watchdog fixo da sequencia de parada
+#define DRYRUN_GRACE_MS  (20LL * 1000)
+#define DAY_MS           (24LL * 60 * 60 * 1000)
+
+#define TANK_VOLUME_M3    2.0
+#define DAILY_LIMIT_M3    18.0
+#define MIN_CYCLES_PER_DAY 1
+#define MAX_CYCLES_PER_DAY 28   // acima disso o watchdog (1440/n - 50) fica <= 0
+
+typedef enum {
+    AUTO_OFF = 0,
+    ST_START_FILL,
+    ST_START_WAIT,
+    A_DECANT,
+    A_PURGE,
+    A_DRAIN,
+    A_FILL,
+    A_WAIT,
+    B_DECANT,
+    B_PURGE,
+    B_DRAIN,
+    B_FILL,
+    B_WAIT,
+    STOP_PURGE,
+    STOP_DRAIN,
+    STOP_DONE,
+} auto_state_t;
+
+static volatile bool auto_enabled = false;
+static volatile bool stop_requested = false;
+static volatile bool skip_requested = false;
+static volatile int32_t num_cycles_per_day = 9; // configuravel pelo app
+static volatile int32_t purge_cycle_minutes = 5;  // purga do Ciclo A/B, configuravel
+static volatile int32_t purge_stop_minutes = 10;  // purga da sequencia de Parar Sistema, configuravel
+static volatile uint32_t total_cycles = 0;        // ciclos A/B completos desde o boot
+static volatile double total_water_in_m3 = 0.0;   // agua estimada que entrou (poco -> tanque)
+static auto_state_t auto_state = AUTO_OFF;
+static int64_t state_enter_time_us = 0;
+static int64_t no_flow_since_us = -1;
+static char fault_msg[64] = "";
+
+// Janela de seguranca da etapa ativa do ciclo (purga+esvazia+enche). Se as
+// boias nao confirmarem a operacao dentro desse prazo, e uma falha real
+// (vazao do poco ou boia com problema), nao um fim de ciclo normal.
+static int64_t watchdog_deadline_us = 0;
+static int64_t watchdog_total_ms = 0;
+
+static inline int64_t elapsed_ms(void)
+{
+    return (esp_timer_get_time() - state_enter_time_us) / 1000;
+}
+
+static inline int64_t purge_cycle_ms(void) { return (int64_t)purge_cycle_minutes * 60 * 1000; }
+static inline int64_t purge_stop_ms(void)  { return (int64_t)purge_stop_minutes * 60 * 1000; }
+
+// Watchdog do ciclo normal (Start/A/B): tempo do ciclo (1440/n) menos a
+// decantacao fixa de 50 min. Recalculado a cada ativacao, usando o
+// numero de ciclos configurado no momento.
+static int64_t get_cycle_watchdog_ms(void)
+{
+    int64_t cycle_period_ms = DAY_MS / num_cycles_per_day;
+    int64_t wd = cycle_period_ms - DECANT_MS;
+    if (wd < 0) wd = 0;
+    return wd;
+}
+
+static void activate_watchdog(int64_t total_ms)
+{
+    watchdog_total_ms = total_ms;
+    watchdog_deadline_us = esp_timer_get_time() + total_ms * 1000;
+}
+
+static inline bool watchdog_expired(void)
+{
+    return esp_timer_get_time() >= watchdog_deadline_us;
+}
+
+// So chamar dentro dos estados ativos (purga/esvazia/enche) protegidos
+// por um watchdog - nao chamar durante os estados de espera (*_WAIT),
+// onde o watchdog expirar e o comportamento normal, nao uma falha.
+static void trigger_fault(const char *msg); // definida mais abaixo
+static void check_watchdog_fault(void)
+{
+    if (watchdog_expired()) {
+        trigger_fault("Problema nas boias ou na vazao do poco");
+    }
+}
+
+static void enter_state(auto_state_t new_state)
+{
+    auto_state = new_state;
+    state_enter_time_us = esp_timer_get_time();
+
+    switch (new_state) {
+        case AUTO_OFF:
+            all_relays_off();
+            break;
+        case ST_START_FILL:
+            fault_msg[0] = '\0';
+            activate_watchdog(get_cycle_watchdog_ms());
+            relay_write(IDX_V1, true);
+            relay_write(IDX_B1, true);
+            break;
+        case ST_START_WAIT:
+            relay_write(IDX_B1, false);
+            relay_write(IDX_V1, false);
+            break;
+        case A_DECANT:
+            // so espera, reles ja desligados pelo estado anterior (*_WAIT)
+            break;
+        case A_PURGE:
+            activate_watchdog(get_cycle_watchdog_ms());
+            relay_write(IDX_V3, true);
+            relay_write(IDX_V6, true);
+            relay_write(IDX_B2, true);
+            break;
+        case A_DRAIN:
+            relay_write(IDX_V5, true);
+            relay_write(IDX_V6, false);
+            break;
+        case A_FILL:
+            relay_write(IDX_V3, false);
+            relay_write(IDX_V5, false);
+            relay_write(IDX_B2, false);
+            relay_write(IDX_V1, true);
+            relay_write(IDX_B1, true);
+            break;
+        case A_WAIT:
+            relay_write(IDX_B1, false);
+            relay_write(IDX_V1, false);
+            break;
+        case B_DECANT:
+            break;
+        case B_PURGE:
+            activate_watchdog(get_cycle_watchdog_ms());
+            relay_write(IDX_V4, true);
+            relay_write(IDX_V6, true);
+            relay_write(IDX_B2, true);
+            break;
+        case B_DRAIN:
+            relay_write(IDX_V5, true);
+            relay_write(IDX_V6, false);
+            break;
+        case B_FILL:
+            relay_write(IDX_V4, false);
+            relay_write(IDX_V5, false);
+            relay_write(IDX_B2, false);
+            relay_write(IDX_V2, true);
+            relay_write(IDX_B1, true);
+            break;
+        case B_WAIT:
+            relay_write(IDX_B1, false);
+            relay_write(IDX_V2, false);
+            break;
+        case STOP_PURGE:
+            activate_watchdog(STOP_WATCHDOG_MS);
+            relay_write(IDX_V3, true);
+            relay_write(IDX_V4, true);
+            relay_write(IDX_V6, true);
+            relay_write(IDX_B2, true);
+            break;
+        case STOP_DRAIN:
+            relay_write(IDX_V5, true);
+            relay_write(IDX_V6, false);
+            break;
+        case STOP_DONE:
+            relay_write(IDX_V3, false);
+            relay_write(IDX_V4, false);
+            relay_write(IDX_V5, false);
+            relay_write(IDX_B2, false);
+            auto_enabled = false;
+            stop_requested = false;
+            enter_state(AUTO_OFF);
+            return;
+    }
+    ESP_LOGI(TAG, "Automacao -> estado %d", (int)new_state);
+}
+
+static const char *auto_state_text(void)
+{
+    if (fault_msg[0]) return fault_msg;
+    switch (auto_state) {
+        case AUTO_OFF:       return "Manual (automatico desligado)";
+        case ST_START_FILL:  return "Start - enchendo tanque 1";
+        case ST_START_WAIT:  return "Aguardando janela do ciclo - tanque 1 cheio";
+        case A_DECANT:       return "Ciclo A - decantando (aguardando 50min)";
+        case A_PURGE:        return "Ciclo A - purgando tanque 1";
+        case A_DRAIN:        return "Ciclo A - esvaziando tanque 1";
+        case A_FILL:         return "Ciclo A - enchendo tanque 1";
+        case A_WAIT:         return "Aguardando janela do ciclo - ciclo A concluido";
+        case B_DECANT:       return "Ciclo B - decantando (aguardando 50min)";
+        case B_PURGE:        return "Ciclo B - purgando tanque 2";
+        case B_DRAIN:        return "Ciclo B - esvaziando tanque 2";
+        case B_FILL:         return "Ciclo B - enchendo tanque 2";
+        case B_WAIT:         return "Aguardando janela do ciclo - ciclo B concluido";
+        case STOP_PURGE:     return "Parando sistema - purgando";
+        case STOP_DRAIN:     return "Parando sistema - esvaziando tanques";
+        case STOP_DONE:      return "Sistema parado";
+        default:             return "-";
+    }
+}
+
+static void trigger_fault(const char *msg)
+{
+    strncpy(fault_msg, msg, sizeof(fault_msg) - 1);
+    fault_msg[sizeof(fault_msg) - 1] = '\0';
+    ESP_LOGE(TAG, "FALHA: %s", msg);
+    all_relays_off();
+    auto_enabled = false;
+    stop_requested = false;
+    auto_state = AUTO_OFF;
+    state_enter_time_us = esp_timer_get_time();
+}
+
+// So chamar durante estados em que a Bomba 1 esta enchendo um tanque
+static void check_dryrun(void)
+{
+    if (!FLOW_ENTRADA_INSTALLED) return;
+
+    bool has_flow = effective_mux_state(MIDX_FLUXO_ENTRADA);
+    if (!has_flow) {
+        if (no_flow_since_us < 0) {
+            no_flow_since_us = esp_timer_get_time();
+        } else if ((esp_timer_get_time() - no_flow_since_us) / 1000 >= DRYRUN_GRACE_MS) {
+            trigger_fault("Sem fluxo na entrada - bomba 1 desligada");
+        }
+    } else {
+        no_flow_since_us = -1;
+    }
+}
+
+static void check_overpressure(void)
+{
+    if (!OVERPRESSURE_INSTALLED) return;
+    if (effective_mux_state(MIDX_FLUXO_OVERPRESSURE)) {
+        trigger_fault("Sobrepressao detectada - sistema desligado");
+    }
+}
+
+static bool is_auto_locked(void)
+{
+    return auto_state != AUTO_OFF;
+}
+
+// Duracao total (ms) do estado atual, para exibir o timer no app.
+// Retorna 0 se o estado depende de nivel de boia (sem timer fixo).
+static int64_t state_total_ms(void)
+{
+    switch (auto_state) {
+        case ST_START_WAIT:
+        case A_WAIT:
+        case B_WAIT:
+            return watchdog_total_ms;
+        case A_DECANT:
+        case B_DECANT:
+            return DECANT_MS;
+        case A_PURGE:
+        case B_PURGE:
+            return purge_cycle_ms();
+        case STOP_PURGE:
+            return purge_stop_ms();
+        default:
+            return 0;
+    }
+}
+
+static int64_t state_remaining_ms(void)
+{
+    int64_t rem;
+    switch (auto_state) {
+        case ST_START_WAIT:
+        case A_WAIT:
+        case B_WAIT:
+            rem = (watchdog_deadline_us - esp_timer_get_time()) / 1000;
+            break;
+        default:
+            rem = state_total_ms() - elapsed_ms();
+            break;
+    }
+    return rem > 0 ? rem : 0;
+}
+
+// Numero de ciclos/dia configurado pelo app. Valida faixa e recalcula o
+// watchdog na proxima ativacao (nao mexe no ciclo que ja esta rodando).
+static bool set_num_cycles_per_day(int32_t n)
+{
+    if (n < MIN_CYCLES_PER_DAY || n > MAX_CYCLES_PER_DAY) return false;
+    num_cycles_per_day = n;
+    ESP_LOGI(TAG, "Ciclos/dia configurado para %d (producao estimada %.1f m3/dia)",
+             (int)n, n * TANK_VOLUME_M3);
+    return true;
+}
+
+static double estimated_daily_m3(void)
+{
+    return num_cycles_per_day * TANK_VOLUME_M3;
+}
+
+static bool set_purge_cycle_minutes(int32_t min)
+{
+    if (min < MIN_PURGE_MIN || min > MAX_PURGE_MIN) return false;
+    purge_cycle_minutes = min;
+    ESP_LOGI(TAG, "Tempo de purga (ciclo) configurado para %d min", (int)min);
+    return true;
+}
+
+static bool set_purge_stop_minutes(int32_t min)
+{
+    if (min < MIN_PURGE_MIN || min > MAX_PURGE_MIN) return false;
+    purge_stop_minutes = min;
+    ESP_LOGI(TAG, "Tempo de purga (parada) configurado para %d min", (int)min);
+    return true;
+}
+
+static void reset_totals(void)
+{
+    total_cycles = 0;
+    total_water_in_m3 = 0.0;
+    ESP_LOGI(TAG, "Totalizadores zerados");
+}
+
+static void automation_task(void *arg)
+{
+    static bool prev_auto_enabled = false;
+
+    while (1) {
+        check_overpressure();
+
+        if (skip_requested) {
+            skip_requested = false;
+            // "Pular" so acelera o relogio do timer atual (deixa ~2s restando).
+            // Nunca pula a checagem de boias/sensores nem o watchdog de seguranca.
+            int64_t total = state_total_ms();
+            if (total > 0) {
+                int64_t fast_forward_ms = total - 2000;
+                if (fast_forward_ms < 0) fast_forward_ms = 0;
+                state_enter_time_us = esp_timer_get_time() - (fast_forward_ms * 1000);
+                // Se o estado atual depende do watchdog (as esperas), adianta
+                // o proprio deadline junto, senao ele ficaria travado no valor antigo.
+                switch (auto_state) {
+                    case ST_START_WAIT:
+                    case A_WAIT:
+                    case B_WAIT:
+                        watchdog_deadline_us = esp_timer_get_time() + 2000LL * 1000;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        if (stop_requested) {
+            if (auto_state != STOP_PURGE && auto_state != STOP_DRAIN && auto_state != STOP_DONE) {
+                all_relays_off();
+                enter_state(STOP_PURGE);
+            }
+        } else {
+            if (prev_auto_enabled && !auto_enabled) {
+                // Toggle desligado direto: corte imediato, sem sequencia de esvaziar.
+                all_relays_off();
+                enter_state(AUTO_OFF);
+            } else if (!prev_auto_enabled && auto_enabled && auto_state == AUTO_OFF) {
+                enter_state(ST_START_FILL);
+            }
+        }
+        prev_auto_enabled = auto_enabled;
+
+        switch (auto_state) {
+            case AUTO_OFF:
+                break;
+            case ST_START_FILL:
+                check_dryrun();
+                check_watchdog_fault();
+                if (tank_high(1)) {
+                    total_water_in_m3 += TANK_VOLUME_M3;
+                    enter_state(ST_START_WAIT);
+                }
+                break;
+            case ST_START_WAIT:
+                if (watchdog_expired()) enter_state(A_DECANT);
+                break;
+            case A_DECANT:
+                if (elapsed_ms() >= DECANT_MS) enter_state(A_PURGE);
+                break;
+            case A_PURGE:
+                check_watchdog_fault();
+                if (elapsed_ms() >= purge_cycle_ms()) enter_state(A_DRAIN);
+                break;
+            case A_DRAIN:
+                check_watchdog_fault();
+                if (tank_low(1)) enter_state(A_FILL);
+                break;
+            case A_FILL:
+                check_dryrun();
+                check_watchdog_fault();
+                if (tank_high(1)) {
+                    total_water_in_m3 += TANK_VOLUME_M3;
+                    total_cycles++;
+                    enter_state(A_WAIT);
+                }
+                break;
+            case A_WAIT:
+                if (watchdog_expired()) enter_state(B_DECANT);
+                break;
+            case B_DECANT:
+                if (elapsed_ms() >= DECANT_MS) enter_state(B_PURGE);
+                break;
+            case B_PURGE:
+                check_watchdog_fault();
+                if (elapsed_ms() >= purge_cycle_ms()) enter_state(B_DRAIN);
+                break;
+            case B_DRAIN:
+                check_watchdog_fault();
+                if (tank_low(2)) enter_state(B_FILL);
+                break;
+            case B_FILL:
+                check_dryrun();
+                check_watchdog_fault();
+                if (tank_high(2)) {
+                    total_water_in_m3 += TANK_VOLUME_M3;
+                    total_cycles++;
+                    enter_state(B_WAIT);
+                }
+                break;
+            case B_WAIT:
+                if (watchdog_expired()) enter_state(A_DECANT);
+                break;
+            case STOP_PURGE:
+                check_watchdog_fault();
+                if (elapsed_ms() >= purge_stop_ms()) enter_state(STOP_DRAIN);
+                break;
+            case STOP_DRAIN:
+                check_watchdog_fault();
+                if (tank_low(1) && tank_low(2)) enter_state(STOP_DONE);
+                break;
+            case STOP_DONE:
+                break;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// ---------------------------------------------------------------------
+// Servidor DNS (captive portal) - responde qualquer consulta com o IP
+// do proprio ESP32, fazendo o celular achar que precisa "fazer login".
+// ---------------------------------------------------------------------
+#define DNS_PORT 53
+#define DNS_MAX_LEN 512
+
+static void dns_server_task(void *arg)
+{
+    char rx_buffer[DNS_MAX_LEN];
+    uint8_t response[DNS_MAX_LEN];
+
+    struct sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(DNS_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS: falha ao criar socket");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS: falha no bind da porta 53");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Servidor DNS (captive portal) rodando na porta 53");
+
+    while (1) {
+        struct sockaddr_in source_addr;
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                            (struct sockaddr *)&source_addr, &socklen);
+        if (len < 12) continue; // menor que um cabecalho DNS valido
+
+        int resp_len = len;
+        memcpy(response, rx_buffer, len);
+
+        response[2] = 0x81; // resposta, sem truncamento
+        response[3] = 0x80; // recursao disponivel
+        response[6] = 0x00; // ANCOUNT high byte
+        response[7] = 0x01; // ANCOUNT = 1 resposta
+
+        response[resp_len++] = 0xC0; response[resp_len++] = 0x0C; // ponteiro pro nome perguntado
+        response[resp_len++] = 0x00; response[resp_len++] = 0x01; // TYPE A
+        response[resp_len++] = 0x00; response[resp_len++] = 0x01; // CLASS IN
+        response[resp_len++] = 0x00; response[resp_len++] = 0x00; response[resp_len++] = 0x00; response[resp_len++] = 0x3C; // TTL 60s
+        response[resp_len++] = 0x00; response[resp_len++] = 0x04; // RDLENGTH = 4 bytes
+        response[resp_len++] = 192;  response[resp_len++] = 168;  response[resp_len++] = 4; response[resp_len++] = 1; // 192.168.4.1
+
+        sendto(sock, response, resp_len, 0, (struct sockaddr *)&source_addr, socklen);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Pagina HTML (embutida no firmware)
 // ---------------------------------------------------------------------
 static const char index_html[] =
 "<!DOCTYPE html><html lang='pt-br'><head><meta charset='utf-8'>"
@@ -199,23 +763,86 @@ static const char index_html[] =
 "<title>qqWater - Controle do Poco</title>"
 "<style>"
 "body{font-family:Arial,sans-serif;background:#0f1720;color:#e8eef5;margin:0;padding:16px;}"
-"h1{font-size:20px;text-align:center;margin-bottom:20px;}"
-".grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:420px;margin:0 auto;}"
-"button{padding:22px 8px;font-size:16px;border:none;border-radius:12px;background:#26313f;color:#e8eef5;"
+"h1{font-size:20px;text-align:center;margin-bottom:16px;}"
+".banner{max-width:420px;margin:0 auto 6px;padding:14px;border-radius:12px;background:#1a232e;"
+"text-align:center;font-size:14px;font-weight:bold;}"
+".banner.fault{background:#5c1f1f;color:#ffb3b3;}"
+".timer{max-width:420px;margin:0 auto 16px;text-align:center;font-size:22px;font-weight:bold;"
+"color:#e8eef5;letter-spacing:1px;}"
+".timer.hidden{display:none;}"
+".autobar{max-width:420px;margin:0 auto 10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;}"
+".switch{position:relative;width:46px;height:26px;flex-shrink:0;}"
+".switch input{opacity:0;width:0;height:0;}"
+".slider{position:absolute;inset:0;background:#26313f;border-radius:26px;cursor:pointer;transition:.2s;}"
+".slider:before{content:'';position:absolute;width:20px;height:20px;left:3px;top:3px;background:#e8eef5;"
+"border-radius:50%;transition:.2s;}"
+"input:checked + .slider{background:#1f9d55;}"
+"input:checked + .slider:before{transform:translateX(20px);}"
+".autobar button{padding:10px 14px;font-size:13px;border:none;border-radius:8px;cursor:pointer;color:#fff;}"
+"#stopBtn{background:#712b13;margin-left:auto;}"
+"#skipBtn{background:#3c3489;}"
+".cyclesbar{max-width:420px;margin:0 auto 10px;display:flex;align-items:center;gap:10px;font-size:13px;}"
+"#cyclesInput{width:56px;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;"
+"font-size:14px;text-align:center;}"
+".limitwarn{max-width:420px;margin:0 auto 14px;padding:10px;border-radius:8px;background:#5c4a1f;"
+"color:#ffe5b3;font-size:12px;text-align:center;}"
+".limitwarn.hidden{display:none;}"
+".purgebar{max-width:420px;margin:0 auto 14px;display:flex;gap:14px;font-size:13px;flex-wrap:wrap;}"
+".purgebar label{display:flex;align-items:center;gap:6px;}"
+".purgebar input{width:52px;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;"
+"font-size:14px;text-align:center;}"
+".totalsbar{max-width:420px;margin:0 auto 14px;display:flex;gap:10px;}"
+".totalbox{flex:1;padding:12px;border-radius:10px;background:#1a232e;text-align:center;}"
+".totalbox b{display:block;font-size:20px;color:#e8eef5;}"
+".totalbox span{font-size:11px;color:#8ea0b3;}"
+"#resetTotalsBtn{width:100%;margin-top:8px;padding:8px;font-size:12px;background:#26313f;color:#8ea0b3;"
+"border:none;border-radius:8px;cursor:pointer;}"
+".grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:420px;margin:16px auto;}"
+"button{padding:22px 8px;font-size:14px;border:none;border-radius:12px;background:#26313f;color:#e8eef5;"
 "cursor:pointer;transition:background .15s;}"
 "button.on{background:#1f9d55;color:#fff;}"
 "button:active{opacity:.8;}"
+"button:disabled{opacity:.35;cursor:not-allowed;}"
 ".status{text-align:center;margin-top:18px;font-size:12px;color:#8ea0b3;}"
-"h2{font-size:14px;color:#8ea0b3;margin:26px auto 10px;max-width:420px;}"
+"h2{font-size:14px;color:#8ea0b3;margin:26px auto 10px;max-width:420px;display:flex;"
+"justify-content:space-between;align-items:center;}"
+"h2 .dbg{font-size:12px;display:flex;align-items:center;gap:6px;color:#8ea0b3;font-weight:normal;}"
 ".inputs{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;max-width:420px;margin:0 auto;}"
 ".pill{padding:10px 12px;border-radius:10px;background:#1a232e;font-size:13px;display:flex;"
-"justify-content:space-between;align-items:center;}"
-".dot{width:10px;height:10px;border-radius:50%;background:#555;flex-shrink:0;margin-left:8px;}"
-".dot.on{background:#1f9d55;}"
+"justify-content:space-between;align-items:center;gap:8px;}"
+".pill input{width:18px;height:18px;flex-shrink:0;}"
 "</style></head><body>"
 "<h1>Controle do Poco - qqWater</h1>"
+"<div class='banner' id='banner'>carregando...</div>"
+"<div class='timer hidden' id='timer'>--:--:--</div>"
+"<div class='autobar'>"
+"<label class='switch'><input type='checkbox' id='autoToggle' onchange='toggleAuto(this.checked)'>"
+"<span class='slider'></span></label>"
+"<span>Modo Automatico</span>"
+"<button id='skipBtn' onclick='skipStep()'>Pular Etapa</button>"
+"<button id='stopBtn' onclick='stopSystem()'>Parar Sistema</button>"
+"</div>"
+"<div class='cyclesbar'>"
+"<span>Ciclos por dia:</span>"
+"<input type='number' id='cyclesInput' min='1' max='28' value='9' onchange='setCycles(this.value)'>"
+"<span id='cyclesInfo'></span>"
+"</div>"
+"<div class='limitwarn hidden' id='limitWarn'>Producao estimada acima do limite diario de 18 m3!</div>"
+"<div class='purgebar'>"
+"<label>Purga ciclo (min): <input type='number' id='purgeCycleInput' min='1' max='60' value='5' "
+"onchange='setPurgeCycle(this.value)'></label>"
+"<label>Purga parada (min): <input type='number' id='purgeStopInput' min='1' max='60' value='10' "
+"onchange='setPurgeStop(this.value)'></label>"
+"</div>"
+"<div class='totalsbar'>"
+"<div class='totalbox'><b id='totalCycles'>0</b><span>ciclos completos</span></div>"
+"<div class='totalbox'><b id='totalWater'>0.0</b><span>m3 (estimado) que entraram</span></div>"
+"</div>"
+"<button id='resetTotalsBtn' onclick='resetTotals()'>Zerar Totalizadores</button>"
 "<div class='grid' id='grid'></div>"
-"<h2>Sensores (leitura)</h2>"
+"<h2><span>Sensores</span><span class='dbg'><label class='switch' style='width:34px;height:20px'>"
+"<input type='checkbox' id='debugToggle' onchange='toggleDebug(this.checked)'>"
+"<span class='slider'></span></label>Modo Debug</span></h2>"
 "<div class='inputs' id='inputs'></div>"
 "<div class='status' id='status'>conectando...</div>"
 "<script>"
@@ -223,8 +850,22 @@ static const char index_html[] =
 "const grid=document.getElementById('grid');"
 "const inputsDiv=document.getElementById('inputs');"
 "const st=document.getElementById('status');"
+"const banner=document.getElementById('banner');"
+"const timerEl=document.getElementById('timer');"
+"const autoToggle=document.getElementById('autoToggle');"
+"const debugToggle=document.getElementById('debugToggle');"
+"const stopBtn=document.getElementById('stopBtn');"
+"const skipBtn=document.getElementById('skipBtn');"
+"const cyclesInput=document.getElementById('cyclesInput');"
+"const cyclesInfo=document.getElementById('cyclesInfo');"
+"const limitWarn=document.getElementById('limitWarn');"
+"const purgeCycleInput=document.getElementById('purgeCycleInput');"
+"const purgeStopInput=document.getElementById('purgeStopInput');"
+"const totalCyclesEl=document.getElementById('totalCycles');"
+"const totalWaterEl=document.getElementById('totalWater');"
 "let buttons=[];"
-"let pills=[];"
+"let checks=[];"
+"let remainingMs=0, lastFetch=0, totalMs=0;"
 "for(let i=0;i<N;i++){"
 "  const b=document.createElement('button');"
 "  b.textContent='Canal '+(i+1);"
@@ -237,6 +878,55 @@ static const char index_html[] =
 "  await fetch('/api/relay?ch='+ch+'&state='+(cur?0:1));"
 "  refresh();"
 "}"
+"async function toggleAuto(checked){"
+"  await fetch('/api/auto?state='+(checked?1:0));"
+"  refresh();"
+"}"
+"async function toggleDebug(checked){"
+"  await fetch('/api/debug/mode?state='+(checked?1:0));"
+"  refresh();"
+"}"
+"async function stopSystem(){"
+"  await fetch('/api/auto/stop');"
+"  refresh();"
+"}"
+"async function skipStep(){"
+"  await fetch('/api/auto/skip');"
+"  refresh();"
+"}"
+"async function setCycles(n){"
+"  await fetch('/api/config/cycles?n='+n);"
+"  refresh();"
+"}"
+"async function setPurgeCycle(min){"
+"  await fetch('/api/config/purge_cycle?min='+min);"
+"  refresh();"
+"}"
+"async function setPurgeStop(min){"
+"  await fetch('/api/config/purge_stop?min='+min);"
+"  refresh();"
+"}"
+"async function resetTotals(){"
+"  await fetch('/api/totals/reset');"
+"  refresh();"
+"}"
+"async function toggleSensor(ch,checked){"
+"  await fetch('/api/debug/set?ch='+ch+'&state='+(checked?1:0));"
+"}"
+"function fmtTime(ms){"
+"  if(ms<0) ms=0;"
+"  const s=Math.floor(ms/1000);"
+"  const hh=String(Math.floor(s/3600)).padStart(2,'0');"
+"  const mm=String(Math.floor((s%3600)/60)).padStart(2,'0');"
+"  const ss=String(s%60).padStart(2,'0');"
+"  return hh+':'+mm+':'+ss;"
+"}"
+"function tickTimer(){"
+"  if(totalMs<=0){ timerEl.classList.add('hidden'); return; }"
+"  timerEl.classList.remove('hidden');"
+"  const elapsedSinceFetch=Date.now()-lastFetch;"
+"  timerEl.textContent=fmtTime(remainingMs-elapsedSinceFetch);"
+"}"
 "async function refresh(){"
 "  try{"
 "    const r=await fetch('/api/status');"
@@ -244,31 +934,52 @@ static const char index_html[] =
 "    for(let i=0;i<N;i++){"
 "      buttons[i].textContent=d.labels[i]+(d.state[i]?' - ON':' - OFF');"
 "      buttons[i].classList.toggle('on',!!d.state[i]);"
+"      buttons[i].disabled=!!d.auto_locked;"
 "    }"
-"    if(pills.length===0 && d.in_labels){"
+"    if(checks.length===0 && d.in_labels){"
 "      for(let i=0;i<d.in_labels.length;i++){"
-"        const p=document.createElement('div');"
+"        const p=document.createElement('label');"
 "        p.className='pill';"
 "        const span=document.createElement('span');"
 "        span.textContent=d.in_labels[i];"
-"        const dot=document.createElement('div');"
-"        dot.className='dot';"
+"        const cb=document.createElement('input');"
+"        cb.type='checkbox';"
+"        cb.onchange=()=>toggleSensor(i,cb.checked);"
 "        p.appendChild(span);"
-"        p.appendChild(dot);"
+"        p.appendChild(cb);"
 "        inputsDiv.appendChild(p);"
-"        pills.push(dot);"
+"        checks.push(cb);"
 "      }"
 "    }"
 "    if(d.in_state){"
 "      for(let i=0;i<d.in_state.length;i++){"
-"        pills[i].classList.toggle('on',!!d.in_state[i]);"
+"        checks[i].checked=!!d.in_state[i];"
+"        checks[i].disabled=!d.debug_mode;"
 "      }"
 "    }"
+"    autoToggle.checked=!!d.auto_enabled;"
+"    debugToggle.checked=!!d.debug_mode;"
+"    banner.textContent=d.auto_state_text;"
+"    banner.classList.toggle('fault',!!d.fault);"
+"    stopBtn.disabled=!d.auto_locked;"
+"    skipBtn.disabled=!d.auto_locked;"
+"    if(document.activeElement!==cyclesInput){ cyclesInput.value=d.num_cycles; }"
+"    cyclesInfo.textContent='('+d.estimated_m3_day.toFixed(1)+' m3/dia estimado)';"
+"    limitWarn.classList.toggle('hidden', !d.over_limit);"
+"    if(document.activeElement!==purgeCycleInput){ purgeCycleInput.value=d.purge_cycle_min; }"
+"    if(document.activeElement!==purgeStopInput){ purgeStopInput.value=d.purge_stop_min; }"
+"    totalCyclesEl.textContent=d.total_cycles;"
+"    totalWaterEl.textContent=d.total_water_in_m3.toFixed(1);"
+"    totalMs=d.state_total_ms||0;"
+"    remainingMs=d.state_remaining_ms||0;"
+"    lastFetch=Date.now();"
+"    tickTimer();"
 "    st.textContent='conectado';"
 "  }catch(e){ st.textContent='sem conexao com o ESP32'; }"
 "}"
 "refresh();"
 "setInterval(refresh,2000);"
+"setInterval(tickTimer,1000);"
 "</script></body></html>";
 
 // ---------------------------------------------------------------------
@@ -282,7 +993,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    char buf[1024];
+    char buf[2048];
     int len = snprintf(buf, sizeof(buf), "{\"labels\":[");
     for (int i = 0; i < NUM_RELAYS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "\"%s\"%s",
@@ -301,9 +1012,37 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     len += snprintf(buf + len, sizeof(buf) - len, "],\"in_state\":[");
     for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "%d%s",
-                         mux_state[i] ? 1 : 0, (i < NUM_MUX_CHANNELS - 1) ? "," : "");
+                         effective_mux_state(i) ? 1 : 0, (i < NUM_MUX_CHANNELS - 1) ? "," : "");
     }
-    len += snprintf(buf + len, sizeof(buf) - len, "]}");
+    len += snprintf(buf + len, sizeof(buf) - len, "],\"debug_state\":[");
+    for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
+        len += snprintf(buf + len, sizeof(buf) - len, "%d%s",
+                         debug_mux_state[i] ? 1 : 0, (i < NUM_MUX_CHANNELS - 1) ? "," : "");
+    }
+
+    int64_t total_ms = state_total_ms();
+    int64_t remaining_ms = state_remaining_ms();
+
+    len += snprintf(buf + len, sizeof(buf) - len,
+                     "],\"auto_enabled\":%s,\"auto_locked\":%s,\"fault\":%s,\"auto_state_text\":\"%s\","
+                     "\"debug_mode\":%s,\"state_total_ms\":%lld,\"state_remaining_ms\":%lld,"
+                     "\"num_cycles\":%d,\"estimated_m3_day\":%.1f,\"over_limit\":%s,"
+                     "\"purge_cycle_min\":%d,\"purge_stop_min\":%d,"
+                     "\"total_cycles\":%lu,\"total_water_in_m3\":%.1f}",
+                     auto_enabled ? "true" : "false",
+                     is_auto_locked() ? "true" : "false",
+                     fault_msg[0] ? "true" : "false",
+                     auto_state_text(),
+                     debug_mode ? "true" : "false",
+                     (long long)total_ms,
+                     (long long)remaining_ms,
+                     (int)num_cycles_per_day,
+                     estimated_daily_m3(),
+                     (estimated_daily_m3() > DAILY_LIMIT_M3) ? "true" : "false",
+                     (int)purge_cycle_minutes,
+                     (int)purge_stop_minutes,
+                     (unsigned long)total_cycles,
+                     total_water_in_m3);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, len);
@@ -311,6 +1050,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
 static esp_err_t relay_get_handler(httpd_req_t *req)
 {
+    if (is_auto_locked()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_send(req, "automacao ativa - desligue o Modo Automatico para controlar manualmente",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+
     char query[64];
     int ch = -1, state = -1;
 
@@ -335,20 +1080,230 @@ static esp_err_t relay_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t auto_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    int state = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "state", val, sizeof(val)) == ESP_OK) {
+            state = atoi(val);
+        }
+    }
+
+    if (state != 0 && state != 1) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "parametro invalido", HTTPD_RESP_USE_STRLEN);
+    }
+
+    auto_enabled = (state == 1);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t auto_stop_get_handler(httpd_req_t *req)
+{
+    stop_requested = true;
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t auto_skip_get_handler(httpd_req_t *req)
+{
+    skip_requested = true;
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t config_cycles_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    int n = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "n", val, sizeof(val)) == ESP_OK) {
+            n = atoi(val);
+        }
+    }
+
+    if (!set_num_cycles_per_day(n)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "numero de ciclos invalido (faixa permitida: 1 a 28)",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t config_purge_cycle_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    int min = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "min", val, sizeof(val)) == ESP_OK) {
+            min = atoi(val);
+        }
+    }
+
+    if (!set_purge_cycle_minutes(min)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "tempo de purga invalido (faixa permitida: 1 a 60 min)",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t config_purge_stop_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    int min = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "min", val, sizeof(val)) == ESP_OK) {
+            min = atoi(val);
+        }
+    }
+
+    if (!set_purge_stop_minutes(min)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "tempo de purga invalido (faixa permitida: 1 a 60 min)",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t totals_reset_get_handler(httpd_req_t *req)
+{
+    reset_totals();
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t debug_mode_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    int state = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "state", val, sizeof(val)) == ESP_OK) {
+            state = atoi(val);
+        }
+    }
+
+    if (state != 0 && state != 1) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "parametro invalido", HTTPD_RESP_USE_STRLEN);
+    }
+
+    debug_mode = (state == 1);
+    ESP_LOGI(TAG, "Modo debug -> %s", debug_mode ? "LIGADO" : "DESLIGADO");
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t debug_set_get_handler(httpd_req_t *req)
+{
+    char query[64];
+    int ch = -1, state = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[8];
+        if (httpd_query_key_value(query, "ch", val, sizeof(val)) == ESP_OK) {
+            ch = atoi(val);
+        }
+        if (httpd_query_key_value(query, "state", val, sizeof(val)) == ESP_OK) {
+            state = atoi(val);
+        }
+    }
+
+    if (ch < 0 || ch >= NUM_MUX_CHANNELS || (state != 0 && state != 1)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "parametros invalidos", HTTPD_RESP_USE_STRLEN);
+    }
+
+    debug_mux_state[ch] = (state == 1);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+// Android, iOS/macOS e Windows batem em URLs conhecidas pra testar se a
+// rede tem internet de verdade. Redirecionando essas URLs pra pagina de
+// controle, o sistema operacional entende que existe um "portal" e
+// mostra a notificacao de login sozinho.
+static esp_err_t captive_redirect_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
+    config.max_uri_handlers = 28;
+    config.uri_match_fn = httpd_uri_match_wildcard;
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler };
-        httpd_uri_t status_uri = { .uri = "/api/status", .method = HTTP_GET, .handler = status_get_handler };
-        httpd_uri_t relay_uri = { .uri = "/api/relay", .method = HTTP_GET, .handler = relay_get_handler };
+        httpd_uri_t root_uri       = { .uri = "/",              .method = HTTP_GET, .handler = root_get_handler };
+        httpd_uri_t status_uri     = { .uri = "/api/status",     .method = HTTP_GET, .handler = status_get_handler };
+        httpd_uri_t relay_uri      = { .uri = "/api/relay",      .method = HTTP_GET, .handler = relay_get_handler };
+        httpd_uri_t auto_uri       = { .uri = "/api/auto",       .method = HTTP_GET, .handler = auto_get_handler };
+        httpd_uri_t auto_stop_uri  = { .uri = "/api/auto/stop",  .method = HTTP_GET, .handler = auto_stop_get_handler };
+        httpd_uri_t auto_skip_uri  = { .uri = "/api/auto/skip",  .method = HTTP_GET, .handler = auto_skip_get_handler };
+        httpd_uri_t debug_mode_uri = { .uri = "/api/debug/mode", .method = HTTP_GET, .handler = debug_mode_get_handler };
+        httpd_uri_t debug_set_uri  = { .uri = "/api/debug/set",  .method = HTTP_GET, .handler = debug_set_get_handler };
+        httpd_uri_t cycles_uri     = { .uri = "/api/config/cycles", .method = HTTP_GET, .handler = config_cycles_get_handler };
+        httpd_uri_t purge_cyc_uri  = { .uri = "/api/config/purge_cycle", .method = HTTP_GET, .handler = config_purge_cycle_get_handler };
+        httpd_uri_t purge_stop_uri = { .uri = "/api/config/purge_stop",  .method = HTTP_GET, .handler = config_purge_stop_get_handler };
+        httpd_uri_t totals_reset_uri = { .uri = "/api/totals/reset", .method = HTTP_GET, .handler = totals_reset_get_handler };
 
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &status_uri);
         httpd_register_uri_handler(server, &relay_uri);
+        httpd_register_uri_handler(server, &auto_uri);
+        httpd_register_uri_handler(server, &auto_stop_uri);
+        httpd_register_uri_handler(server, &auto_skip_uri);
+        httpd_register_uri_handler(server, &debug_mode_uri);
+        httpd_register_uri_handler(server, &debug_set_uri);
+        httpd_register_uri_handler(server, &cycles_uri);
+        httpd_register_uri_handler(server, &purge_cyc_uri);
+        httpd_register_uri_handler(server, &purge_stop_uri);
+        httpd_register_uri_handler(server, &totals_reset_uri);
+
+        // URLs conhecidas de deteccao de captive portal (Android/iOS/Windows)
+        static const char *captive_paths[] = {
+            "/generate_204", "/gen_204",
+            "/hotspot-detect.html", "/library/test/success.html",
+            "/connecttest.txt", "/ncsi.txt", "/success.txt",
+        };
+        static httpd_uri_t captive_uris[7];
+        for (int i = 0; i < 7; i++) {
+            captive_uris[i].uri = captive_paths[i];
+            captive_uris[i].method = HTTP_GET;
+            captive_uris[i].handler = captive_redirect_handler;
+            httpd_register_uri_handler(server, &captive_uris[i]);
+        }
+
+        // Coringa: qualquer outra URL nao reconhecida tambem redireciona.
+        // Precisa ser o ULTIMO registrado (menor prioridade de match).
+        static httpd_uri_t wildcard_uri = { .uri = "/*", .method = HTTP_GET, .handler = captive_redirect_handler };
+        httpd_register_uri_handler(server, &wildcard_uri);
     } else {
         ESP_LOGE(TAG, "Falha ao iniciar o servidor web");
     }
@@ -394,7 +1349,6 @@ static void wifi_init_softap(void)
 // ---------------------------------------------------------------------
 void app_main(void)
 {
-    // NVS é exigido pelo driver Wi-Fi
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -402,11 +1356,12 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Primeiro os relés (todos desligados), depois entradas, rede e servidor
     relays_init();
     mux_init();
     xTaskCreate(mux_task, "mux_task", 3072, NULL, 5, NULL);
+    xTaskCreate(automation_task, "automation_task", 4096, NULL, 5, NULL);
     wifi_init_softap();
+    xTaskCreate(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL);
     start_webserver();
 
     ESP_LOGI(TAG, "qqWater pronto. Conecte na rede '%s' e acesse http://192.168.4.1", AP_SSID);
