@@ -23,7 +23,9 @@
  *   notar boot instavel, ligar um pull-down de 10k entre GPIO12 e GND.
  *
  * LOGICA DE AUTOMACAO (maquina de estados):
- *   Start: abre V1, liga B1, enche T1 -> aguarda 2h -> Ciclo A
+ *   Start (tudo vazio): ativa watchdog de 110 min -> abre V1, liga B1,
+ *   enche T1 -> desliga B1/V1 -> aguarda 50 min -> abre V2, liga B1,
+ *   enche T2 -> desliga B1/V2 -> aguarda watchdog -> Ciclo A
  *   Ciclo A: purga T1 (5min) -> esvazia T1 (V5) -> enche T1 -> aguarda 2h -> Ciclo B
  *   Ciclo B: purga T2 (5min) -> esvazia T2 (V5) -> enche T2 -> aguarda 2h -> Ciclo A
  *   Stop: purga T1+T2 (10min) -> esvazia os dois (V5) -> desliga tudo -> Modo Automatico OFF
@@ -45,6 +47,7 @@
 #include "driver/gpio.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "nvs.h"
 
 static const char *TAG = "qqwater";
 
@@ -264,6 +267,8 @@ static inline bool tank_low(int tank)  { return tank == 1 ? !effective_mux_state
 typedef enum {
     AUTO_OFF = 0,
     ST_START_FILL,
+    ST_START_DECANT,
+    ST_START_FILL2,
     ST_START_WAIT,
     A_DECANT,
     A_PURGE,
@@ -285,7 +290,6 @@ static volatile bool stop_requested = false;
 static volatile bool skip_requested = false;
 static volatile int32_t num_cycles_per_day = 9; // configuravel pelo app
 static volatile int32_t purge_cycle_minutes = 5;  // purga do Ciclo A/B, configuravel
-static volatile int32_t purge_stop_minutes = 10;  // purga da sequencia de Parar Sistema, configuravel
 static volatile uint32_t total_cycles = 0;        // ciclos A/B completos desde o boot
 static volatile double total_water_in_m3 = 0.0;   // agua estimada que entrou (poco -> tanque)
 static auto_state_t auto_state = AUTO_OFF;
@@ -305,7 +309,7 @@ static inline int64_t elapsed_ms(void)
 }
 
 static inline int64_t purge_cycle_ms(void) { return (int64_t)purge_cycle_minutes * 60 * 1000; }
-static inline int64_t purge_stop_ms(void)  { return (int64_t)purge_stop_minutes * 60 * 1000; }
+static inline int64_t purge_stop_ms(void)  { return purge_cycle_ms() * 2; }
 
 // Watchdog do ciclo normal (Start/A/B): tempo do ciclo (1440/n) menos a
 // decantacao fixa de 50 min. Recalculado a cada ativacao, usando o
@@ -355,9 +359,17 @@ static void enter_state(auto_state_t new_state)
             relay_write(IDX_V1, true);
             relay_write(IDX_B1, true);
             break;
-        case ST_START_WAIT:
+        case ST_START_DECANT:
             relay_write(IDX_B1, false);
             relay_write(IDX_V1, false);
+            break;
+        case ST_START_FILL2:
+            relay_write(IDX_V2, true);
+            relay_write(IDX_B1, true);
+            break;
+        case ST_START_WAIT:
+            relay_write(IDX_B1, false);
+            relay_write(IDX_V2, false);
             break;
         case A_DECANT:
             // so espera, reles ja desligados pelo estado anterior (*_WAIT)
@@ -436,7 +448,9 @@ static const char *auto_state_text(void)
     switch (auto_state) {
         case AUTO_OFF:       return "Manual (automatico desligado)";
         case ST_START_FILL:  return "Start - enchendo tanque 1";
-        case ST_START_WAIT:  return "Aguardando janela do ciclo - tanque 1 cheio";
+        case ST_START_DECANT:return "Start - decantando (aguardando 50min)";
+        case ST_START_FILL2: return "Start - enchendo tanque 2";
+        case ST_START_WAIT:  return "Start - aguardando watchdog para ciclo A";
         case A_DECANT:       return "Ciclo A - decantando (aguardando 50min)";
         case A_PURGE:        return "Ciclo A - purgando tanque 1";
         case A_DRAIN:        return "Ciclo A - esvaziando tanque 1";
@@ -505,6 +519,7 @@ static int64_t state_total_ms(void)
         case A_WAIT:
         case B_WAIT:
             return watchdog_total_ms;
+        case ST_START_DECANT:
         case A_DECANT:
         case B_DECANT:
             return DECANT_MS;
@@ -558,18 +573,62 @@ static bool set_purge_cycle_minutes(int32_t min)
     return true;
 }
 
-static bool set_purge_stop_minutes(int32_t min)
+static void load_totals_from_nvs(void)
 {
-    if (min < MIN_PURGE_MIN || min > MAX_PURGE_MIN) return false;
-    purge_stop_minutes = min;
-    ESP_LOGI(TAG, "Tempo de purga (parada) configurado para %d min", (int)min);
-    return true;
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "NVS de totalizadores nao encontrado, usando valores iniciais");
+        return;
+    }
+
+    uint32_t cycles = 0;
+    uint32_t water_x10 = 0;
+    err = nvs_get_u32(handle, "tot_cycles", &cycles);
+    if (err == ESP_OK) {
+        total_cycles = cycles;
+    }
+    err = nvs_get_u32(handle, "tot_water_x10", &water_x10);
+    if (err == ESP_OK) {
+        total_water_in_m3 = (double)water_x10 / 10.0;
+    }
+
+    nvs_close(handle);
+    ESP_LOGI(TAG, "Totalizadores carregados da NVS: ciclos=%lu, agua=%.1f m3",
+             (unsigned long)total_cycles, total_water_in_m3);
+}
+
+static void save_totals_to_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao abrir NVS para gravar totalizadores: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint32_t water_x10 = (uint32_t)(total_water_in_m3 * 10.0 + 0.5);
+    err = nvs_set_u32(handle, "tot_cycles", total_cycles);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao salvar total_cycles na NVS: %s", esp_err_to_name(err));
+    }
+    err = nvs_set_u32(handle, "tot_water_x10", water_x10);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao salvar total_water_x10 na NVS: %s", esp_err_to_name(err));
+    }
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao confirmar gravacao da NVS: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
 }
 
 static void reset_totals(void)
 {
     total_cycles = 0;
     total_water_in_m3 = 0.0;
+    save_totals_to_nvs();
     ESP_LOGI(TAG, "Totalizadores zerados");
 }
 
@@ -627,6 +686,19 @@ static void automation_task(void *arg)
                 check_watchdog_fault();
                 if (tank_high(1)) {
                     total_water_in_m3 += TANK_VOLUME_M3;
+                    save_totals_to_nvs();
+                    enter_state(ST_START_DECANT);
+                }
+                break;
+            case ST_START_DECANT:
+                if (elapsed_ms() >= DECANT_MS) enter_state(ST_START_FILL2);
+                break;
+            case ST_START_FILL2:
+                check_dryrun();
+                check_watchdog_fault();
+                if (tank_high(2)) {
+                    total_water_in_m3 += TANK_VOLUME_M3;
+                    save_totals_to_nvs();
                     enter_state(ST_START_WAIT);
                 }
                 break;
@@ -650,6 +722,7 @@ static void automation_task(void *arg)
                 if (tank_high(1)) {
                     total_water_in_m3 += TANK_VOLUME_M3;
                     total_cycles++;
+                    save_totals_to_nvs();
                     enter_state(A_WAIT);
                 }
                 break;
@@ -673,6 +746,7 @@ static void automation_task(void *arg)
                 if (tank_high(2)) {
                     total_water_in_m3 += TANK_VOLUME_M3;
                     total_cycles++;
+                    save_totals_to_nvs();
                     enter_state(B_WAIT);
                 }
                 break;
@@ -770,7 +844,8 @@ static const char index_html[] =
 ".timer{max-width:420px;margin:0 auto 16px;text-align:center;font-size:22px;font-weight:bold;"
 "color:#e8eef5;letter-spacing:1px;}"
 ".timer.hidden{display:none;}"
-".autobar{max-width:420px;margin:0 auto 10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;}"
+".autobar{max-width:420px;margin:0 auto 10px;display:grid;grid-template-columns:auto auto 1fr auto auto;align-items:center;gap:10px;}"
+".autobar > span{white-space:nowrap;}"
 ".switch{position:relative;width:46px;height:26px;flex-shrink:0;}"
 ".switch input{opacity:0;width:0;height:0;}"
 ".slider{position:absolute;inset:0;background:#26313f;border-radius:26px;cursor:pointer;transition:.2s;}"
@@ -778,28 +853,29 @@ static const char index_html[] =
 "border-radius:50%;transition:.2s;}"
 "input:checked + .slider{background:#1f9d55;}"
 "input:checked + .slider:before{transform:translateX(20px);}"
-".autobar button{padding:10px 14px;font-size:13px;border:none;border-radius:8px;cursor:pointer;color:#fff;}"
-"#stopBtn{background:#712b13;margin-left:auto;}"
-"#skipBtn{background:#3c3489;}"
-".cyclesbar{max-width:420px;margin:0 auto 10px;display:flex;align-items:center;gap:10px;font-size:13px;}"
+".autobar button{padding:10px 14px;font-size:13px;border:none;border-radius:8px;cursor:pointer;color:#fff;white-space:nowrap;}"
+"#stopBtn{background:#712b13;justify-self:end;}"
+"#skipBtn{background:#3c3489;justify-self:end;}"
+".cyclesbar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:10px;font-size:13px;}"
+".cyclesbar span:first-child{white-space:nowrap;}"
 "#cyclesInput{width:56px;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;"
 "font-size:14px;text-align:center;}"
 ".limitwarn{max-width:420px;margin:0 auto 14px;padding:10px;border-radius:8px;background:#5c4a1f;"
 "color:#ffe5b3;font-size:12px;text-align:center;}"
 ".limitwarn.hidden{display:none;}"
-".purgebar{max-width:420px;margin:0 auto 14px;display:flex;gap:14px;font-size:13px;flex-wrap:wrap;}"
-".purgebar label{display:flex;align-items:center;gap:6px;}"
+".purgebar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:1fr;gap:8px;font-size:13px;}"
+".purgebar label{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;}"
 ".purgebar input{width:52px;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;"
-"font-size:14px;text-align:center;}"
-".totalsbar{max-width:420px;margin:0 auto 14px;display:flex;gap:10px;}"
-".totalbox{flex:1;padding:12px;border-radius:10px;background:#1a232e;text-align:center;}"
+"font-size:14px;text-align:center;flex-shrink:0;}"
+".totalsbar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:10px;}"
+".totalbox{padding:12px;border-radius:10px;background:#1a232e;text-align:center;min-width:0;}"
 ".totalbox b{display:block;font-size:20px;color:#e8eef5;}"
 ".totalbox span{font-size:11px;color:#8ea0b3;}"
 "#resetTotalsBtn{width:100%;margin-top:8px;padding:8px;font-size:12px;background:#26313f;color:#8ea0b3;"
 "border:none;border-radius:8px;cursor:pointer;}"
-".grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:420px;margin:16px auto;}"
+".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:420px;margin:16px auto;}"
 "button{padding:22px 8px;font-size:14px;border:none;border-radius:12px;background:#26313f;color:#e8eef5;"
-"cursor:pointer;transition:background .15s;}"
+"cursor:pointer;transition:background .15s;min-height:62px;display:flex;align-items:center;justify-content:center;}"
 "button.on{background:#1f9d55;color:#fff;}"
 "button:active{opacity:.8;}"
 "button:disabled{opacity:.35;cursor:not-allowed;}"
@@ -807,6 +883,9 @@ static const char index_html[] =
 "h2{font-size:14px;color:#8ea0b3;margin:26px auto 10px;max-width:420px;display:flex;"
 "justify-content:space-between;align-items:center;}"
 "h2 .dbg{font-size:12px;display:flex;align-items:center;gap:6px;color:#8ea0b3;font-weight:normal;}"
+"h2 .dbg .switch{width:34px;height:20px;}"
+"h2 .dbg .slider:before{width:14px;height:14px;left:3px;top:3px;}"
+"h2 .dbg input:checked + .slider:before{transform:translateX(14px);}"
 ".inputs{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;max-width:420px;margin:0 auto;}"
 ".pill{padding:10px 12px;border-radius:10px;background:#1a232e;font-size:13px;display:flex;"
 "justify-content:space-between;align-items:center;gap:8px;}"
@@ -831,8 +910,6 @@ static const char index_html[] =
 "<div class='purgebar'>"
 "<label>Purga ciclo (min): <input type='number' id='purgeCycleInput' min='1' max='60' value='5' "
 "onchange='setPurgeCycle(this.value)'></label>"
-"<label>Purga parada (min): <input type='number' id='purgeStopInput' min='1' max='60' value='10' "
-"onchange='setPurgeStop(this.value)'></label>"
 "</div>"
 "<div class='totalsbar'>"
 "<div class='totalbox'><b id='totalCycles'>0</b><span>ciclos completos</span></div>"
@@ -860,7 +937,6 @@ static const char index_html[] =
 "const cyclesInfo=document.getElementById('cyclesInfo');"
 "const limitWarn=document.getElementById('limitWarn');"
 "const purgeCycleInput=document.getElementById('purgeCycleInput');"
-"const purgeStopInput=document.getElementById('purgeStopInput');"
 "const totalCyclesEl=document.getElementById('totalCycles');"
 "const totalWaterEl=document.getElementById('totalWater');"
 "let buttons=[];"
@@ -900,10 +976,6 @@ static const char index_html[] =
 "}"
 "async function setPurgeCycle(min){"
 "  await fetch('/api/config/purge_cycle?min='+min);"
-"  refresh();"
-"}"
-"async function setPurgeStop(min){"
-"  await fetch('/api/config/purge_stop?min='+min);"
 "  refresh();"
 "}"
 "async function resetTotals(){"
@@ -967,7 +1039,6 @@ static const char index_html[] =
 "    cyclesInfo.textContent='('+d.estimated_m3_day.toFixed(1)+' m3/dia estimado)';"
 "    limitWarn.classList.toggle('hidden', !d.over_limit);"
 "    if(document.activeElement!==purgeCycleInput){ purgeCycleInput.value=d.purge_cycle_min; }"
-"    if(document.activeElement!==purgeStopInput){ purgeStopInput.value=d.purge_stop_min; }"
 "    totalCyclesEl.textContent=d.total_cycles;"
 "    totalWaterEl.textContent=d.total_water_in_m3.toFixed(1);"
 "    totalMs=d.state_total_ms||0;"
@@ -1027,7 +1098,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                      "],\"auto_enabled\":%s,\"auto_locked\":%s,\"fault\":%s,\"auto_state_text\":\"%s\","
                      "\"debug_mode\":%s,\"state_total_ms\":%lld,\"state_remaining_ms\":%lld,"
                      "\"num_cycles\":%d,\"estimated_m3_day\":%.1f,\"over_limit\":%s,"
-                     "\"purge_cycle_min\":%d,\"purge_stop_min\":%d,"
+                     "\"purge_cycle_min\":%d,"
                      "\"total_cycles\":%lu,\"total_water_in_m3\":%.1f}",
                      auto_enabled ? "true" : "false",
                      is_auto_locked() ? "true" : "false",
@@ -1040,7 +1111,6 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                      estimated_daily_m3(),
                      (estimated_daily_m3() > DAILY_LIMIT_M3) ? "true" : "false",
                      (int)purge_cycle_minutes,
-                     (int)purge_stop_minutes,
                      (unsigned long)total_cycles,
                      total_water_in_m3);
 
@@ -1161,28 +1231,6 @@ static esp_err_t config_purge_cycle_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t config_purge_stop_get_handler(httpd_req_t *req)
-{
-    char query[32];
-    int min = -1;
-
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char val[8];
-        if (httpd_query_key_value(query, "min", val, sizeof(val)) == ESP_OK) {
-            min = atoi(val);
-        }
-    }
-
-    if (!set_purge_stop_minutes(min)) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return httpd_resp_send(req, "tempo de purga invalido (faixa permitida: 1 a 60 min)",
-                                HTTPD_RESP_USE_STRLEN);
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
-}
-
 static esp_err_t totals_reset_get_handler(httpd_req_t *req)
 {
     reset_totals();
@@ -1270,7 +1318,6 @@ static httpd_handle_t start_webserver(void)
         httpd_uri_t debug_set_uri  = { .uri = "/api/debug/set",  .method = HTTP_GET, .handler = debug_set_get_handler };
         httpd_uri_t cycles_uri     = { .uri = "/api/config/cycles", .method = HTTP_GET, .handler = config_cycles_get_handler };
         httpd_uri_t purge_cyc_uri  = { .uri = "/api/config/purge_cycle", .method = HTTP_GET, .handler = config_purge_cycle_get_handler };
-        httpd_uri_t purge_stop_uri = { .uri = "/api/config/purge_stop",  .method = HTTP_GET, .handler = config_purge_stop_get_handler };
         httpd_uri_t totals_reset_uri = { .uri = "/api/totals/reset", .method = HTTP_GET, .handler = totals_reset_get_handler };
 
         httpd_register_uri_handler(server, &root_uri);
@@ -1283,7 +1330,6 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &debug_set_uri);
         httpd_register_uri_handler(server, &cycles_uri);
         httpd_register_uri_handler(server, &purge_cyc_uri);
-        httpd_register_uri_handler(server, &purge_stop_uri);
         httpd_register_uri_handler(server, &totals_reset_uri);
 
         // URLs conhecidas de deteccao de captive portal (Android/iOS/Windows)
@@ -1355,6 +1401,7 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    load_totals_from_nvs();
 
     relays_init();
     mux_init();
