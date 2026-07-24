@@ -3,32 +3,32 @@
  *
  * - ESP32 cria uma rede Wi-Fi propria (Access Point)
  * - Captive portal: DNS + redirecionamentos abrem a pagina sozinhos
- *   ao conectar (igual wifi de aeroporto)
+ * ao conectar (igual wifi de aeroporto)
  * - Servidor web com 8 boteos manuais (bloqueados durante automacao)
  * - Toggle "Modo Automatico" + botao "Parar Sistema"
  * - Modulo de rele optoacoplado, ativo em HIGH
  * - Leitura de 10 sensores digitais via mux CD74HC4067 / HW-178
- *   (boias dos tanques, chaves de fluxo, feedback das bombas)
+ * (boias dos tanques, chaves de fluxo, feedback das bombas)
  *
  * Reles (nesta ordem = canal 0 a 7):
- *   GPIO13(V1) GPIO12(V2) GPIO14(V3) GPIO27(V4)
- *   GPIO15(V5) GPIO2(V6)  GPIO4(B1)  GPIO16(B2)
+ * GPIO13(V1) GPIO12(V2) GPIO14(V3) GPIO27(V4)
+ * GPIO15(V5) GPIO2(V6)  GPIO4(B1)  GPIO16(B2)
  *
  * Mux de entrada (S0,S1,S2,S3,SIG):
- *   GPIO21, GPIO19, GPIO18, GPIO5, GPIO17
+ * GPIO21, GPIO19, GPIO18, GPIO5, GPIO17
  *
  * ATENCAO DE HARDWARE:
- *   GPIO12, GPIO2, GPIO15 e GPIO5 sao "strapping pins" do ESP32. O que
- *   mais importa na pratica e o GPIO12 (tensao da flash no boot). Se
- *   notar boot instavel, ligar um pull-down de 10k entre GPIO12 e GND.
+ * GPIO12, GPIO2, GPIO15 e GPIO5 sao "strapping pins" do ESP32. O que
+ * mais importa na pratica e o GPIO12 (tensao da flash no boot). Se
+ * notar boot instavel, ligar um pull-down de 10k entre GPIO12 e GND.
  *
  * LOGICA DE AUTOMACAO (maquina de estados):
- *   Start (tudo vazio): ativa watchdog de 110 min -> abre V1, liga B1,
- *   enche T1 -> desliga B1/V1 -> aguarda 50 min -> abre V2, liga B1,
- *   enche T2 -> desliga B1/V2 -> aguarda watchdog -> Ciclo A
- *   Ciclo A: purga T1 (5min) -> esvazia T1 (V5) -> enche T1 -> aguarda 2h -> Ciclo B
- *   Ciclo B: purga T2 (5min) -> esvazia T2 (V5) -> enche T2 -> aguarda 2h -> Ciclo A
- *   Stop: purga T1+T2 (10min) -> esvazia os dois (V5) -> desliga tudo -> Modo Automatico OFF
+ * Start (tudo vazio): ativa watchdog de 110 min -> abre V1, liga B1,
+ * enche T1 -> desliga B1/V1 -> aguarda 50 min -> abre V2, liga B1,
+ * enche T2 -> desliga B1/V2 -> aguarda watchdog -> Ciclo A
+ * Ciclo A: purga T1 (5min) -> esvazia T1 (V5) -> enche T1 -> aguarda 2h -> Ciclo B
+ * Ciclo B: purga T2 (5min) -> esvazia T2 (V5) -> enche T2 -> aguarda 2h -> Ciclo A
+ * Stop: purga T1+T2 (10min) -> esvazia os dois (V5) -> desliga tudo -> Modo Automatico OFF
  */
 
 #include <string.h>
@@ -844,8 +844,8 @@ static const char index_html[] =
 ".timer{max-width:420px;margin:0 auto 16px;text-align:center;font-size:22px;font-weight:bold;"
 "color:#e8eef5;letter-spacing:1px;}"
 ".timer.hidden{display:none;}"
-".autobar{max-width:420px;margin:0 auto 10px;display:grid;grid-template-columns:auto auto 1fr auto auto;align-items:center;gap:10px;}"
-".autobar > span{white-space:nowrap;}"
+".autobar{max-width:420px;margin:0 auto 10px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;}"
+".autobar-left{display:flex;align-items:center;gap:8px;flex:1 1 100%;}"
 ".switch{position:relative;width:46px;height:26px;flex-shrink:0;}"
 ".switch input{opacity:0;width:0;height:0;}"
 ".slider{position:absolute;inset:0;background:#26313f;border-radius:26px;cursor:pointer;transition:.2s;}"
@@ -853,20 +853,14 @@ static const char index_html[] =
 "border-radius:50%;transition:.2s;}"
 "input:checked + .slider{background:#1f9d55;}"
 "input:checked + .slider:before{transform:translateX(20px);}"
-".autobar button{padding:10px 14px;font-size:13px;border:none;border-radius:8px;cursor:pointer;color:#fff;white-space:nowrap;}"
+".autobar button{flex:1;padding:12px 10px;font-size:13px;border:none;border-radius:8px;cursor:pointer;color:#fff;white-space:nowrap;}"
 "#stopBtn{background:#712b13;justify-self:end;}"
 "#skipBtn{background:#3c3489;justify-self:end;}"
-".cyclesbar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:auto auto 1fr;align-items:center;gap:10px;font-size:13px;}"
-".cyclesbar span:first-child{white-space:nowrap;}"
-"#cyclesInput{width:56px;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;"
-"font-size:14px;text-align:center;}"
+".cyclesbar, .purgebar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:125px 60px 1fr;align-items:center;gap:10px;font-size:13px;}"
+".cyclesbar input, .purgebar input{width:100%;box-sizing:border-box;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;font-size:14px;text-align:center;}"
 ".limitwarn{max-width:420px;margin:0 auto 14px;padding:10px;border-radius:8px;background:#5c4a1f;"
 "color:#ffe5b3;font-size:12px;text-align:center;}"
 ".limitwarn.hidden{display:none;}"
-".purgebar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:1fr;gap:8px;font-size:13px;}"
-".purgebar label{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;}"
-".purgebar input{width:52px;padding:6px;border-radius:6px;border:none;background:#26313f;color:#e8eef5;"
-"font-size:14px;text-align:center;flex-shrink:0;}"
 ".totalsbar{max-width:420px;margin:0 auto 14px;display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:10px;}"
 ".totalbox{padding:12px;border-radius:10px;background:#1a232e;text-align:center;min-width:0;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:4px;}"
 ".totalbox b{display:block;font-size:20px;color:#e8eef5;line-height:1.1;}"
@@ -895,9 +889,11 @@ static const char index_html[] =
 "<div class='banner' id='banner'>carregando...</div>"
 "<div class='timer hidden' id='timer'>--:--:--</div>"
 "<div class='autobar'>"
+"<div class='autobar-left'>"
 "<label class='switch'><input type='checkbox' id='autoToggle' onchange='toggleAuto(this.checked)'>"
 "<span class='slider'></span></label>"
 "<span>Modo Automatico</span>"
+"</div>"
 "<button id='skipBtn' onclick='skipStep()'>Pular Etapa</button>"
 "<button id='stopBtn' onclick='stopSystem()'>Parar Sistema</button>"
 "</div>"
@@ -908,8 +904,9 @@ static const char index_html[] =
 "</div>"
 "<div class='limitwarn hidden' id='limitWarn'>Producao estimada acima do limite diario de 18 m3!</div>"
 "<div class='purgebar'>"
-"<label>Purga ciclo (min): <input type='number' id='purgeCycleInput' min='1' max='60' value='5' "
-"onchange='setPurgeCycle(this.value)'></label>"
+"<span>Purga ciclo (min):</span>"
+"<input type='number' id='purgeCycleInput' min='1' max='60' value='5' onchange='setPurgeCycle(this.value)'>"
+"<span></span>"
 "</div>"
 "<div class='totalsbar'>"
 "<div class='totalbox'><b id='totalCycles'>0</b><span>ciclos completos</span></div>"
