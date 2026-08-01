@@ -118,29 +118,28 @@ static void relays_init(void)
 }
 
 // ---------------------------------------------------------------------
-// Leitura do multiplexador CD74HC4067 / HW-178 (16 canais)
+// Leitura direta das boias nos pinos configurados
 // ---------------------------------------------------------------------
-#define MUX_S0  GPIO_NUM_21
-#define MUX_S1  GPIO_NUM_19
-#define MUX_S2  GPIO_NUM_18
-#define MUX_S3  GPIO_NUM_5
-#define MUX_SIG GPIO_NUM_17
+#define BOIA_T1_ALTO_PIN GPIO_NUM_17
+#define BOIA_T1_BAIXO_PIN GPIO_NUM_5
+#define BOIA_T2_ALTO_PIN GPIO_NUM_18
+#define BOIA_T2_BAIXO_PIN GPIO_NUM_19
+#define BOIA_COMMON_PIN   GPIO_NUM_21
 
-static const gpio_num_t mux_select_pins[4] = { MUX_S0, MUX_S1, MUX_S2, MUX_S3 };
+#define NUM_SENSOR_CHANNELS 4
 
-#define NUM_MUX_CHANNELS 10
+static const gpio_num_t boia_pins[NUM_SENSOR_CHANNELS] = {
+    BOIA_T1_ALTO_PIN,
+    BOIA_T1_BAIXO_PIN,
+    BOIA_T2_ALTO_PIN,
+    BOIA_T2_BAIXO_PIN,
+};
 
-static const char *mux_labels[NUM_MUX_CHANNELS] = {
+static const char *boia_labels[NUM_SENSOR_CHANNELS] = {
     "Tanque 1 - Alto",
     "Tanque 1 - Baixo",
     "Tanque 2 - Alto",
     "Tanque 2 - Baixo",
-    "Fluxo - Entrada",
-    "Fluxo - Saida",
-    "Fluxo - Purga",
-    "Fluxo - Overpressure",
-    "Bomba 1 - Feedback",
-    "Bomba 2 - Feedback",
 };
 
 // Indices para deixar a logica de automacao legivel
@@ -148,92 +147,81 @@ static const char *mux_labels[NUM_MUX_CHANNELS] = {
 #define MIDX_T1_BAIXO 1
 #define MIDX_T2_ALTO 2
 #define MIDX_T2_BAIXO 3
-#define MIDX_FLUXO_ENTRADA 4
-#define MIDX_FLUXO_SAIDA 5
-#define MIDX_FLUXO_PURGA 6
-#define MIDX_FLUXO_OVERPRESSURE 7
-#define MIDX_BOMBA1_FB 8
-#define MIDX_BOMBA2_FB 9
 
-// Fiacao: cada chave liga o canal ao GND quando ACIONADA, pull-up interno no SIG.
-#define MUX_TRIGGERED_LEVEL 0
+// Comportamento real da boia:
+// - quando a boia boia, o circuito fica aberto e o pino fica flutuando (sem contato)
+// - quando a boia afunda, o contato fecha e o pino e puxado para baixo pelo pull-down
+// Para simplificar, consideramos "ativo/acionado" como o estado de flutuaçao (sem contato),
+// e "normal" como o estado de contato fechado puxado para LOW.
+#define BOIA_FLOATING_LEVEL 0
 
-static bool mux_state[NUM_MUX_CHANNELS] = {false};
-static int  mux_debounce_count[NUM_MUX_CHANNELS] = {0};
-static bool mux_last_raw[NUM_MUX_CHANNELS] = {false};
-#define MUX_DEBOUNCE_THRESHOLD 3
-#define MUX_POLL_PERIOD_MS 50
+static bool boia_state[NUM_SENSOR_CHANNELS] = {false};
+static int  boia_debounce_count[NUM_SENSOR_CHANNELS] = {0};
+static bool boia_last_raw[NUM_SENSOR_CHANNELS] = {false};
+#define BOIA_DEBOUNCE_THRESHOLD 3
+#define BOIA_POLL_PERIOD_MS 50
 
-static void mux_select_channel(int ch)
+static void boias_init(void)
 {
-    gpio_set_level(MUX_S0, (ch >> 0) & 0x01);
-    gpio_set_level(MUX_S1, (ch >> 1) & 0x01);
-    gpio_set_level(MUX_S2, (ch >> 2) & 0x01);
-    gpio_set_level(MUX_S3, (ch >> 3) & 0x01);
-    esp_rom_delay_us(50);
-}
+    gpio_reset_pin(BOIA_COMMON_PIN);
+    gpio_set_direction(BOIA_COMMON_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BOIA_COMMON_PIN, 1);
 
-static void mux_init(void)
-{
-    for (int i = 0; i < 4; i++) {
-        gpio_reset_pin(mux_select_pins[i]);
-        gpio_set_direction(mux_select_pins[i], GPIO_MODE_OUTPUT);
-        gpio_set_level(mux_select_pins[i], 0);
+    for (int i = 0; i < NUM_SENSOR_CHANNELS; i++) {
+        gpio_reset_pin(boia_pins[i]);
+        gpio_set_direction(boia_pins[i], GPIO_MODE_INPUT);
+        gpio_set_pull_mode(boia_pins[i], GPIO_PULLDOWN_ONLY);
     }
 
-    gpio_reset_pin(MUX_SIG);
-    gpio_set_direction(MUX_SIG, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(MUX_SIG, GPIO_PULLUP_ONLY);
-
-    ESP_LOGI(TAG, "Mux inicializado (S0=%d S1=%d S2=%d S3=%d SIG=%d)",
-             MUX_S0, MUX_S1, MUX_S2, MUX_S3, MUX_SIG);
+    ESP_LOGI(TAG, "Boias inicializadas nos pinos T1 alto=%d T1 baixo=%d T2 alto=%d T2 baixo=%d comum=%d",
+             BOIA_T1_ALTO_PIN, BOIA_T1_BAIXO_PIN, BOIA_T2_ALTO_PIN, BOIA_T2_BAIXO_PIN, BOIA_COMMON_PIN);
 }
 
-static void mux_poll_once(void)
+static void boias_poll_once(void)
 {
-    for (int ch = 0; ch < NUM_MUX_CHANNELS; ch++) {
-        mux_select_channel(ch);
-        int raw_level = gpio_get_level(MUX_SIG);
-        bool raw_triggered = (raw_level == MUX_TRIGGERED_LEVEL);
+    for (int ch = 0; ch < NUM_SENSOR_CHANNELS; ch++) {
+        int raw_level = gpio_get_level(boia_pins[ch]);
+        bool raw_triggered = (raw_level == BOIA_FLOATING_LEVEL);
 
-        if (raw_triggered == mux_last_raw[ch]) {
-            if (mux_debounce_count[ch] < MUX_DEBOUNCE_THRESHOLD) {
-                mux_debounce_count[ch]++;
+        if (raw_triggered == boia_last_raw[ch]) {
+            if (boia_debounce_count[ch] < BOIA_DEBOUNCE_THRESHOLD) {
+                boia_debounce_count[ch]++;
             }
         } else {
-            mux_last_raw[ch] = raw_triggered;
-            mux_debounce_count[ch] = 0;
+            boia_last_raw[ch] = raw_triggered;
+            boia_debounce_count[ch] = 0;
         }
 
-        if (mux_debounce_count[ch] >= MUX_DEBOUNCE_THRESHOLD && mux_state[ch] != raw_triggered) {
-            mux_state[ch] = raw_triggered;
-            ESP_LOGI(TAG, "Entrada %d (%s) -> %s", ch, mux_labels[ch],
-                     raw_triggered ? "ACIONADO" : "normal");
+        if (boia_debounce_count[ch] >= BOIA_DEBOUNCE_THRESHOLD && boia_state[ch] != raw_triggered) {
+            boia_state[ch] = raw_triggered;
+            ESP_LOGI(TAG, "Boia %d (%s) -> %s", ch, boia_labels[ch],
+                     raw_triggered ? "ACIONADA" : "normal");
         }
     }
 }
 
-static void mux_task(void *arg)
+static void boias_task(void *arg)
 {
     while (1) {
-        mux_poll_once();
-        vTaskDelay(pdMS_TO_TICKS(MUX_POLL_PERIOD_MS));
+        boias_poll_once();
+        vTaskDelay(pdMS_TO_TICKS(BOIA_POLL_PERIOD_MS));
     }
 }
 
 // ---------------------------------------------------------------------
-// Modo debug: ignora a leitura real do mux e usa valores definidos
+// Modo debug: ignora a leitura real das boias e usa valores definidos
 // manualmente pelo app, para testar a automacao sem sensores fisicos.
 // ---------------------------------------------------------------------
 static volatile bool debug_mode = false;
-static volatile bool debug_mux_state[NUM_MUX_CHANNELS] = {false};
+static volatile bool debug_sensor_state[NUM_SENSOR_CHANNELS] = {false};
 
-static inline bool effective_mux_state(int ch)
+static inline bool effective_sensor_state(int ch)
 {
-    return debug_mode ? debug_mux_state[ch] : mux_state[ch];
+    if (ch < 0 || ch >= NUM_SENSOR_CHANNELS) return false;
+    return debug_mode ? debug_sensor_state[ch] : boia_state[ch];
 }
 
-static inline bool tank_high(int tank) { return tank == 1 ? effective_mux_state(MIDX_T1_ALTO) : effective_mux_state(MIDX_T2_ALTO); }
+static inline bool tank_high(int tank) { return tank == 1 ? effective_sensor_state(MIDX_T1_ALTO) : effective_sensor_state(MIDX_T2_ALTO); }
 
 // A boia de fundo (baixo) e do tipo NF/NC: fica fechada (GND) sempre que
 // ha agua acima dela (enchendo, cheio) e SO abre (libera o pull-up, HIGH)
@@ -242,7 +230,7 @@ static inline bool tank_high(int tank) { return tank == 1 ? effective_mux_state(
 //   alto=HIGH, baixo=HIGH -> vazio        (tank_low = true)
 //   alto=HIGH, baixo=GND  -> enchendo/esvaziando (tank_low = false)
 //   alto=GND,  baixo=GND  -> cheio        (tank_low = false)
-static inline bool tank_low(int tank)  { return tank == 1 ? !effective_mux_state(MIDX_T1_BAIXO) : !effective_mux_state(MIDX_T2_BAIXO); }
+static inline bool tank_low(int tank)  { return tank == 1 ? !effective_sensor_state(MIDX_T1_BAIXO) : !effective_sensor_state(MIDX_T2_BAIXO); }
 
 // ---------------------------------------------------------------------
 // Automacao (maquina de estados)
@@ -485,7 +473,7 @@ static void check_dryrun(void)
 {
     if (!FLOW_ENTRADA_INSTALLED) return;
 
-    bool has_flow = effective_mux_state(MIDX_FLUXO_ENTRADA);
+    bool has_flow = false;
     if (!has_flow) {
         if (no_flow_since_us < 0) {
             no_flow_since_us = esp_timer_get_time();
@@ -500,7 +488,7 @@ static void check_dryrun(void)
 static void check_overpressure(void)
 {
     if (!OVERPRESSURE_INSTALLED) return;
-    if (effective_mux_state(MIDX_FLUXO_OVERPRESSURE)) {
+    if (false) {
         trigger_fault("Sobrepressao detectada - sistema desligado");
     }
 }
@@ -1073,19 +1061,19 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                          relay_state[i] ? 1 : 0, (i < NUM_RELAYS - 1) ? "," : "");
     }
     len += snprintf(buf + len, sizeof(buf) - len, "],\"in_labels\":[");
-    for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
+    for (int i = 0; i < NUM_SENSOR_CHANNELS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "\"%s\"%s",
-                         mux_labels[i], (i < NUM_MUX_CHANNELS - 1) ? "," : "");
+                         boia_labels[i], (i < NUM_SENSOR_CHANNELS - 1) ? "," : "");
     }
     len += snprintf(buf + len, sizeof(buf) - len, "],\"in_state\":[");
-    for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
+    for (int i = 0; i < NUM_SENSOR_CHANNELS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "%d%s",
-                         effective_mux_state(i) ? 1 : 0, (i < NUM_MUX_CHANNELS - 1) ? "," : "");
+                         effective_sensor_state(i) ? 1 : 0, (i < NUM_SENSOR_CHANNELS - 1) ? "," : "");
     }
     len += snprintf(buf + len, sizeof(buf) - len, "],\"debug_state\":[");
-    for (int i = 0; i < NUM_MUX_CHANNELS; i++) {
+    for (int i = 0; i < NUM_SENSOR_CHANNELS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "%d%s",
-                         debug_mux_state[i] ? 1 : 0, (i < NUM_MUX_CHANNELS - 1) ? "," : "");
+                         debug_sensor_state[i] ? 1 : 0, (i < NUM_SENSOR_CHANNELS - 1) ? "," : "");
     }
 
     int64_t total_ms = state_total_ms();
@@ -1274,12 +1262,12 @@ static esp_err_t debug_set_get_handler(httpd_req_t *req)
         }
     }
 
-    if (ch < 0 || ch >= NUM_MUX_CHANNELS || (state != 0 && state != 1)) {
+    if (ch < 0 || ch >= NUM_SENSOR_CHANNELS || (state != 0 && state != 1)) {
         httpd_resp_set_status(req, "400 Bad Request");
         return httpd_resp_send(req, "parametros invalidos", HTTPD_RESP_USE_STRLEN);
     }
 
-    debug_mux_state[ch] = (state == 1);
+    debug_sensor_state[ch] = (state == 1);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1401,8 +1389,8 @@ void app_main(void)
     load_totals_from_nvs();
 
     relays_init();
-    mux_init();
-    xTaskCreate(mux_task, "mux_task", 3072, NULL, 5, NULL);
+    boias_init();
+    xTaskCreate(boias_task, "boias_task", 3072, NULL, 5, NULL);
     xTaskCreate(automation_task, "automation_task", 4096, NULL, 5, NULL);
     wifi_init_softap();
     xTaskCreate(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL);
