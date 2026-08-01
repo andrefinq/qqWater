@@ -120,8 +120,8 @@ static void relays_init(void)
 // ---------------------------------------------------------------------
 // Leitura direta das boias nos pinos configurados
 // ---------------------------------------------------------------------
-#define BOIA_T1_ALTO_PIN GPIO_NUM_17
-#define BOIA_T1_BAIXO_PIN GPIO_NUM_5
+#define BOIA_T1_ALTO_PIN GPIO_NUM_22
+#define BOIA_T1_BAIXO_PIN GPIO_NUM_23
 #define BOIA_T2_ALTO_PIN GPIO_NUM_18
 #define BOIA_T2_BAIXO_PIN GPIO_NUM_19
 #define BOIA_COMMON_PIN   GPIO_NUM_21
@@ -158,6 +158,7 @@ static const char *boia_labels[NUM_SENSOR_CHANNELS] = {
 static bool boia_state[NUM_SENSOR_CHANNELS] = {false};
 static int  boia_debounce_count[NUM_SENSOR_CHANNELS] = {0};
 static bool boia_last_raw[NUM_SENSOR_CHANNELS] = {false};
+static bool boia_available[NUM_SENSOR_CHANNELS] = {true, true, true, true};
 #define BOIA_DEBOUNCE_THRESHOLD 3
 #define BOIA_POLL_PERIOD_MS 50
 
@@ -171,6 +172,7 @@ static void boias_init(void)
         gpio_reset_pin(boia_pins[i]);
         gpio_set_direction(boia_pins[i], GPIO_MODE_INPUT);
         gpio_set_pull_mode(boia_pins[i], GPIO_PULLDOWN_ONLY);
+        boia_available[i] = true;
     }
 
     ESP_LOGI(TAG, "Boias inicializadas nos pinos T1 alto=%d T1 baixo=%d T2 alto=%d T2 baixo=%d comum=%d",
@@ -215,9 +217,15 @@ static void boias_task(void *arg)
 static volatile bool debug_mode = false;
 static volatile bool debug_sensor_state[NUM_SENSOR_CHANNELS] = {false};
 
+static inline bool sensor_available(int ch)
+{
+    return (ch >= 0 && ch < NUM_SENSOR_CHANNELS && boia_available[ch]);
+}
+
 static inline bool effective_sensor_state(int ch)
 {
     if (ch < 0 || ch >= NUM_SENSOR_CHANNELS) return false;
+    if (!sensor_available(ch)) return false;
     return debug_mode ? debug_sensor_state[ch] : boia_state[ch];
 }
 
@@ -230,7 +238,14 @@ static inline bool tank_high(int tank) { return tank == 1 ? effective_sensor_sta
 //   alto=HIGH, baixo=HIGH -> vazio        (tank_low = true)
 //   alto=HIGH, baixo=GND  -> enchendo/esvaziando (tank_low = false)
 //   alto=GND,  baixo=GND  -> cheio        (tank_low = false)
-static inline bool tank_low(int tank)  { return tank == 1 ? !effective_sensor_state(MIDX_T1_BAIXO) : !effective_sensor_state(MIDX_T2_BAIXO); }
+static inline bool tank_low(int tank)
+{
+    int idx = (tank == 1) ? MIDX_T1_BAIXO : MIDX_T2_BAIXO;
+    if (!sensor_available(idx)) {
+        return false;
+    }
+    return !effective_sensor_state(idx);
+}
 
 // ---------------------------------------------------------------------
 // Automacao (maquina de estados)
@@ -702,7 +717,7 @@ static void automation_task(void *arg)
                 break;
             case A_DRAIN:
                 check_watchdog_fault();
-                if (tank_low(1)) enter_state(A_FILL);
+                if (tank_low(1) || !sensor_available(MIDX_T1_BAIXO)) enter_state(A_FILL);
                 break;
             case A_FILL:
                 check_dryrun();
@@ -726,7 +741,7 @@ static void automation_task(void *arg)
                 break;
             case B_DRAIN:
                 check_watchdog_fault();
-                if (tank_low(2)) enter_state(B_FILL);
+                if (tank_low(2) || !sensor_available(MIDX_T2_BAIXO)) enter_state(B_FILL);
                 break;
             case B_FILL:
                 check_dryrun();
