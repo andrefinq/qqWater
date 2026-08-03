@@ -106,6 +106,12 @@ static void all_relays_off(void)
     }
 }
 
+static void relay_b2_delayed_on(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(30000));
+    relay_write(IDX_B2, true);
+}
+
 static void relays_init(void)
 {
     for (int i = 0; i < NUM_RELAYS; i++) {
@@ -260,6 +266,7 @@ static inline bool tank_low(int tank)
 #define MAX_PURGE_MIN 60
 #define STOP_WATCHDOG_MS (30LL * 60 * 1000)   // watchdog fixo da sequencia de parada
 #define DRYRUN_GRACE_MS  (20LL * 1000)
+#define B2_START_DELAY_MS (30LL * 1000)
 #define DAY_MS           (24LL * 60 * 60 * 1000)
 
 #define TANK_VOLUME_M3    2.0
@@ -299,6 +306,8 @@ static auto_state_t auto_state = AUTO_OFF;
 static int64_t state_enter_time_us = 0;
 static int64_t no_flow_since_us = -1;
 static char fault_msg[64] = "";
+static bool b2_start_pending = false;
+static int64_t b2_start_deadline_us = 0;
 
 // Janela de seguranca da etapa ativa do ciclo (purga+esvazia+enche). Se as
 // boias nao confirmarem a operacao dentro desse prazo, e uma falha real
@@ -351,6 +360,7 @@ static void enter_state(auto_state_t new_state)
 {
     auto_state = new_state;
     state_enter_time_us = esp_timer_get_time();
+    b2_start_pending = false;
 
     switch (new_state) {
         case AUTO_OFF:
@@ -381,11 +391,19 @@ static void enter_state(auto_state_t new_state)
             activate_watchdog(get_cycle_watchdog_ms());
             relay_write(IDX_V3, true);
             relay_write(IDX_V6, true);
-            relay_write(IDX_B2, true);
+            relay_b2_delayed_on();
             break;
         case A_DRAIN:
             relay_write(IDX_V5, true);
             relay_write(IDX_V6, false);
+            if (!relay_state[IDX_B2]) {
+                relay_write(IDX_B2, false);
+                b2_start_pending = true;
+                b2_start_deadline_us = esp_timer_get_time() + B2_START_DELAY_MS * 1000;
+                ESP_LOGI(TAG, "Atraso de %d s para ligar B2 (estado A_DRAIN)", (int)(B2_START_DELAY_MS / 1000));
+            } else {
+                relay_b2_delayed_on();
+            }
             break;
         case A_FILL:
             relay_write(IDX_V3, false);
@@ -404,11 +422,19 @@ static void enter_state(auto_state_t new_state)
             activate_watchdog(get_cycle_watchdog_ms());
             relay_write(IDX_V4, true);
             relay_write(IDX_V6, true);
-            relay_write(IDX_B2, true);
+            relay_b2_delayed_on();
             break;
         case B_DRAIN:
             relay_write(IDX_V5, true);
             relay_write(IDX_V6, false);
+            if (!relay_state[IDX_B2]) {
+                relay_write(IDX_B2, false);
+                b2_start_pending = true;
+                b2_start_deadline_us = esp_timer_get_time() + B2_START_DELAY_MS * 1000;
+                ESP_LOGI(TAG, "Atraso de %d s para ligar B2 (estado B_DRAIN)", (int)(B2_START_DELAY_MS / 1000));
+            } else {
+                relay_b2_delayed_on();
+            }
             break;
         case B_FILL:
             relay_write(IDX_V4, false);
@@ -426,7 +452,7 @@ static void enter_state(auto_state_t new_state)
             relay_write(IDX_V3, true);
             relay_write(IDX_V4, true);
             relay_write(IDX_V6, true);
-            relay_write(IDX_B2, true);
+            relay_b2_delayed_on();
             break;
         case STOP_DRAIN:
             relay_write(IDX_V5, true);
@@ -713,10 +739,18 @@ static void automation_task(void *arg)
                 break;
             case A_PURGE:
                 check_watchdog_fault();
+                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
+                    relay_b2_delayed_on();
+                    b2_start_pending = false;
+                }
                 if (elapsed_ms() >= purge_cycle_ms()) enter_state(A_DRAIN);
                 break;
             case A_DRAIN:
                 check_watchdog_fault();
+                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
+                    relay_b2_delayed_on();
+                    b2_start_pending = false;
+                }
                 if (tank_low(1) || !sensor_available(MIDX_T1_BAIXO)) enter_state(A_FILL);
                 break;
             case A_FILL:
@@ -737,10 +771,18 @@ static void automation_task(void *arg)
                 break;
             case B_PURGE:
                 check_watchdog_fault();
+                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
+                    relay_b2_delayed_on();
+                    b2_start_pending = false;
+                }
                 if (elapsed_ms() >= purge_cycle_ms()) enter_state(B_DRAIN);
                 break;
             case B_DRAIN:
                 check_watchdog_fault();
+                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
+                    relay_b2_delayed_on();
+                    b2_start_pending = false;
+                }
                 if (tank_low(2) || !sensor_available(MIDX_T2_BAIXO)) enter_state(B_FILL);
                 break;
             case B_FILL:
