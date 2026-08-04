@@ -38,6 +38,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -253,6 +254,139 @@ static inline bool tank_low(int tank)
 }
 
 // ---------------------------------------------------------------------
+// RTC DS1302 (mantem a hora real durante quedas de energia)
+// Protocolo proprio de 3 fios (nao e I2C nem SPI padrao).
+// ---------------------------------------------------------------------
+#define DS1302_CLK_PIN GPIO_NUM_25
+#define DS1302_DAT_PIN GPIO_NUM_26
+#define DS1302_RST_PIN GPIO_NUM_33
+
+#define DS1302_REG_SECONDS 0x80
+#define DS1302_REG_MINUTES 0x82
+#define DS1302_REG_HOURS   0x84
+#define DS1302_REG_DATE    0x86
+#define DS1302_REG_MONTH   0x88
+#define DS1302_REG_DAY     0x8A
+#define DS1302_REG_YEAR    0x8C
+#define DS1302_REG_WP      0x8E
+
+static inline uint8_t ds1302_bcd_to_dec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
+static inline uint8_t ds1302_dec_to_bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+static void ds1302_write_byte(uint8_t data)
+{
+    gpio_set_direction(DS1302_DAT_PIN, GPIO_MODE_OUTPUT);
+    for (int i = 0; i < 8; i++) {
+        gpio_set_level(DS1302_DAT_PIN, (data >> i) & 0x01);
+        esp_rom_delay_us(2);
+        gpio_set_level(DS1302_CLK_PIN, 1);
+        esp_rom_delay_us(2);
+        gpio_set_level(DS1302_CLK_PIN, 0);
+        esp_rom_delay_us(2);
+    }
+}
+
+static uint8_t ds1302_read_byte(void)
+{
+    uint8_t data = 0;
+    gpio_set_direction(DS1302_DAT_PIN, GPIO_MODE_INPUT);
+    for (int i = 0; i < 8; i++) {
+        if (gpio_get_level(DS1302_DAT_PIN)) data |= (1 << i);
+        esp_rom_delay_us(2);
+        gpio_set_level(DS1302_CLK_PIN, 1);
+        esp_rom_delay_us(2);
+        gpio_set_level(DS1302_CLK_PIN, 0);
+        esp_rom_delay_us(2);
+    }
+    return data;
+}
+
+static void ds1302_write_reg(uint8_t addr, uint8_t data)
+{
+    gpio_set_level(DS1302_RST_PIN, 0);
+    gpio_set_level(DS1302_CLK_PIN, 0);
+    esp_rom_delay_us(4);
+    gpio_set_level(DS1302_RST_PIN, 1);
+    esp_rom_delay_us(4);
+    ds1302_write_byte(addr);
+    ds1302_write_byte(data);
+    gpio_set_level(DS1302_RST_PIN, 0);
+    esp_rom_delay_us(4);
+}
+
+static uint8_t ds1302_read_reg(uint8_t addr)
+{
+    gpio_set_level(DS1302_RST_PIN, 0);
+    gpio_set_level(DS1302_CLK_PIN, 0);
+    esp_rom_delay_us(4);
+    gpio_set_level(DS1302_RST_PIN, 1);
+    esp_rom_delay_us(4);
+    ds1302_write_byte(addr | 0x01);
+    uint8_t val = ds1302_read_byte();
+    gpio_set_level(DS1302_RST_PIN, 0);
+    esp_rom_delay_us(4);
+    return val;
+}
+
+static void ds1302_init(void)
+{
+    gpio_reset_pin(DS1302_CLK_PIN);
+    gpio_reset_pin(DS1302_DAT_PIN);
+    gpio_reset_pin(DS1302_RST_PIN);
+    gpio_set_direction(DS1302_CLK_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(DS1302_RST_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(DS1302_CLK_PIN, 0);
+    gpio_set_level(DS1302_RST_PIN, 0);
+
+    ds1302_write_reg(DS1302_REG_WP, 0x00); // desabilita write-protect
+
+    // Garante que o clock nao esta em modo "halt" (bit 7 dos segundos)
+    uint8_t sec = ds1302_read_reg(DS1302_REG_SECONDS);
+    if (sec & 0x80) {
+        ds1302_write_reg(DS1302_REG_SECONDS, sec & 0x7F);
+        ESP_LOGI(TAG, "RTC DS1302: clock estava parado (CH=1), reiniciado");
+    }
+
+    ESP_LOGI(TAG, "RTC DS1302 inicializado (CLK=%d DAT=%d RST=%d)",
+             DS1302_CLK_PIN, DS1302_DAT_PIN, DS1302_RST_PIN);
+}
+
+// Retorna epoch (segundos desde 1970) da hora atual gravada no RTC.
+// Se o RTC nunca foi configurado, provavelmente vai retornar uma data
+// invalida/antiga - por isso e importante configurar a hora pelo app
+// pelo menos uma vez apos instalar o modulo.
+static int64_t ds1302_get_epoch(void)
+{
+    struct tm t = {0};
+    t.tm_sec  = ds1302_bcd_to_dec(ds1302_read_reg(DS1302_REG_SECONDS) & 0x7F);
+    t.tm_min  = ds1302_bcd_to_dec(ds1302_read_reg(DS1302_REG_MINUTES));
+    t.tm_hour = ds1302_bcd_to_dec(ds1302_read_reg(DS1302_REG_HOURS) & 0x3F);
+    t.tm_mday = ds1302_bcd_to_dec(ds1302_read_reg(DS1302_REG_DATE));
+    t.tm_mon  = ds1302_bcd_to_dec(ds1302_read_reg(DS1302_REG_MONTH)) - 1;
+    t.tm_year = ds1302_bcd_to_dec(ds1302_read_reg(DS1302_REG_YEAR)) + 100; // 20xx -> anos desde 1900
+    t.tm_isdst = 0;
+    return (int64_t)mktime(&t);
+}
+
+static void ds1302_set_epoch(int64_t epoch)
+{
+    time_t tt = (time_t)epoch;
+    struct tm t;
+    gmtime_r(&tt, &t);
+
+    ds1302_write_reg(DS1302_REG_WP, 0x00);
+    ds1302_write_reg(DS1302_REG_SECONDS, ds1302_dec_to_bcd(t.tm_sec));
+    ds1302_write_reg(DS1302_REG_MINUTES, ds1302_dec_to_bcd(t.tm_min));
+    ds1302_write_reg(DS1302_REG_HOURS, ds1302_dec_to_bcd(t.tm_hour)); // formato 24h
+    ds1302_write_reg(DS1302_REG_DATE, ds1302_dec_to_bcd(t.tm_mday));
+    ds1302_write_reg(DS1302_REG_MONTH, ds1302_dec_to_bcd(t.tm_mon + 1));
+    ds1302_write_reg(DS1302_REG_DAY, ds1302_dec_to_bcd((t.tm_wday == 0) ? 7 : t.tm_wday));
+    ds1302_write_reg(DS1302_REG_YEAR, ds1302_dec_to_bcd((t.tm_year + 1900) % 100));
+
+    ESP_LOGI(TAG, "RTC DS1302 ajustado para epoch %lld", (long long)epoch);
+}
+
+// ---------------------------------------------------------------------
 // Automacao (maquina de estados)
 // ---------------------------------------------------------------------
 // Flags de sensores ainda nao instalados. Mude para true quando ligar
@@ -300,6 +434,20 @@ static volatile bool skip_requested = false;
 static volatile int32_t num_cycles_per_day = 9; // configuravel pelo app
 static volatile int32_t purge_cycle_minutes = 5;  // purga do Ciclo A/B, configuravel
 static volatile uint32_t total_cycles = 0;        // ciclos A/B completos desde o boot
+
+// Offset entre epoch real (RTC) e o timer interno (esp_timer, zera no boot).
+// epoch_now() = boot_epoch_offset + (esp_timer_get_time()/1e6). Calculado
+// uma vez no boot lendo o RTC; atualizado tambem se o usuario reconfigurar a hora.
+static int64_t boot_epoch_offset = 0;
+
+static inline int64_t epoch_now(void) { return boot_epoch_offset + esp_timer_get_time() / 1000000; }
+static inline int64_t us_to_epoch(int64_t us) { return boot_epoch_offset + us / 1000000; }
+static inline int64_t epoch_to_us(int64_t epoch) { return (epoch - boot_epoch_offset) * 1000000; }
+
+// Log simples de quedas de energia detectadas no boot
+static volatile uint32_t total_outages = 0;
+static volatile int64_t last_outage_duration_s = 0;
+static volatile int64_t last_outage_epoch = 0;
 static volatile double total_water_in_m3 = 0.0;   // agua estimada que entrou (poco -> tanque)
 static auto_state_t auto_state = AUTO_OFF;
 static int64_t state_enter_time_us = 0;
@@ -369,11 +517,15 @@ static void schedule_b2_start(void)
     ESP_LOGI(TAG, "Atraso de %d s agendado para ligar B2", (int)(B2_START_DELAY_MS / 1000));
 }
 
-static void enter_state(auto_state_t new_state)
-{
-    auto_state = new_state;
-    state_enter_time_us = esp_timer_get_time();
+static void persist_automation_state(void); // definida mais abaixo (depende do RTC/NVS)
 
+// So os efeitos colaterais de entrar num estado (reles, watchdog, delay da B2).
+// Usada tanto pela entrada normal (enter_state) quanto pela retomada apos
+// reinicio/queda de energia - nesse segundo caso, o chamador ajusta os
+// cronometros por conta propria logo em seguida, para preservar o tempo
+// que ja tinha passado antes do reinicio.
+static void apply_state_side_effects(auto_state_t new_state)
+{
     switch (new_state) {
         case AUTO_OFF:
             b2_start_pending = false;
@@ -462,9 +614,26 @@ static void enter_state(auto_state_t new_state)
             relay_write(IDX_B2, false);
             auto_enabled = false;
             stop_requested = false;
-            enter_state(AUTO_OFF);
-            return;
+            break;
     }
+}
+
+static void enter_state(auto_state_t new_state)
+{
+    if (new_state == STOP_DONE) {
+        // Efeito colateral proprio (desliga tudo, limpa flags) + encerra em AUTO_OFF
+        apply_state_side_effects(STOP_DONE);
+        auto_state = STOP_DONE;
+        state_enter_time_us = esp_timer_get_time();
+        persist_automation_state();
+        enter_state(AUTO_OFF);
+        return;
+    }
+
+    auto_state = new_state;
+    state_enter_time_us = esp_timer_get_time();
+    apply_state_side_effects(new_state);
+    persist_automation_state();
     ESP_LOGI(TAG, "Automacao -> estado %d", (int)new_state);
 }
 
@@ -659,12 +828,149 @@ static void reset_totals(void)
     ESP_LOGI(TAG, "Totalizadores zerados");
 }
 
+// Salva o estado atual da automacao (usando epoch real do RTC, nao o
+// timer interno) para que possamos retomar de onde paramos apos uma
+// queda de energia. Chamada a cada transicao de estado e periodicamente
+// (heartbeat) para tambem servir de "ultimo sinal de vida" conhecido.
+static void persist_automation_state(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao abrir NVS para salvar estado da automacao: %s", esp_err_to_name(err));
+        return;
+    }
+
+    nvs_set_u32(handle, "auto_state", (uint32_t)auto_state);
+    nvs_set_u8(handle, "auto_en", auto_enabled ? 1 : 0);
+    nvs_set_i64(handle, "st_enter_ep", us_to_epoch(state_enter_time_us));
+    nvs_set_i64(handle, "wd_deadline_ep", us_to_epoch(watchdog_deadline_us));
+    nvs_set_i64(handle, "last_seen_ep", epoch_now());
+    nvs_set_i32(handle, "n_cycles", num_cycles_per_day);
+    nvs_set_i32(handle, "purge_min", purge_cycle_minutes);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// So a "config" (numero de ciclos, tempo de purga) - carregada sempre no
+// boot, independente de ter havido queda de energia ou nao.
+static void load_config_from_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READONLY, &handle);
+    if (err != ESP_OK) return;
+
+    int32_t n = 0, purge = 0;
+    if (nvs_get_i32(handle, "n_cycles", &n) == ESP_OK) set_num_cycles_per_day(n);
+    if (nvs_get_i32(handle, "purge_min", &purge) == ESP_OK) set_purge_cycle_minutes(purge);
+
+    nvs_close(handle);
+}
+
+static void save_outage_log_to_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return;
+
+    nvs_set_u32(handle, "n_outages", total_outages);
+    nvs_set_i64(handle, "out_dur_s", last_outage_duration_s);
+    nvs_set_i64(handle, "out_ep", last_outage_epoch);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void load_outage_log_from_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READONLY, &handle);
+    if (err != ESP_OK) return;
+
+    uint32_t n = 0;
+    int64_t dur = 0, ep = 0;
+    if (nvs_get_u32(handle, "n_outages", &n) == ESP_OK) total_outages = n;
+    if (nvs_get_i64(handle, "out_dur_s", &dur) == ESP_OK) last_outage_duration_s = dur;
+    if (nvs_get_i64(handle, "out_ep", &ep) == ESP_OK) last_outage_epoch = ep;
+
+    nvs_close(handle);
+}
+
+// Chamada uma vez no boot, depois do RTC inicializado. Detecta se houve
+// queda de energia (comparando o ultimo "sinal de vida" salvo com a hora
+// atual) e, se o automatico estava ligado, retoma o mesmo estado
+// recalculando o tempo decorrido a partir do epoch real - inclusive o
+// tempo do watchdog, que pode ja ter expirado durante a queda (nesse
+// caso a proxima checagem do loop vai detectar isso normalmente, como
+// se fosse uma falha real de boia/vazao).
+static void resume_or_detect_outage(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "Nenhum estado salvo encontrado (primeira vez ou NVS limpa)");
+        return;
+    }
+
+    uint32_t saved_state = AUTO_OFF;
+    uint8_t saved_enabled = 0;
+    int64_t saved_enter_ep = 0;
+    int64_t saved_wd_ep = 0;
+    int64_t saved_last_seen_ep = 0;
+
+    nvs_get_u32(handle, "auto_state", &saved_state);
+    nvs_get_u8(handle, "auto_en", &saved_enabled);
+    nvs_get_i64(handle, "st_enter_ep", &saved_enter_ep);
+    nvs_get_i64(handle, "wd_deadline_ep", &saved_wd_ep);
+    nvs_get_i64(handle, "last_seen_ep", &saved_last_seen_ep);
+    nvs_close(handle);
+
+    int64_t now_ep = epoch_now();
+
+    // Reinicio normal (reflash, reset manual) leva poucos segundos; um
+    // intervalo maior que isso desde o ultimo sinal de vida indica queda real.
+    if (saved_last_seen_ep > 0) {
+        int64_t gap_s = now_ep - saved_last_seen_ep;
+        if (gap_s > 90) {
+            total_outages++;
+            last_outage_duration_s = gap_s;
+            last_outage_epoch = saved_last_seen_ep;
+            save_outage_log_to_nvs();
+            ESP_LOGW(TAG, "Queda de energia detectada: durou aproximadamente %lld s", (long long)gap_s);
+        }
+    }
+
+    if (saved_enabled && saved_state != AUTO_OFF && saved_state != STOP_DONE) {
+        int64_t elapsed_in_state_s = now_ep - saved_enter_ep;
+        if (elapsed_in_state_s < 0) elapsed_in_state_s = 0;
+        int64_t remaining_wd_s = saved_wd_ep - now_ep;
+
+        auto_state = (auto_state_t)saved_state;
+        apply_state_side_effects(auto_state);
+        state_enter_time_us = esp_timer_get_time() - elapsed_in_state_s * 1000000LL;
+        watchdog_deadline_us = esp_timer_get_time() + remaining_wd_s * 1000000LL;
+        auto_enabled = true;
+
+        ESP_LOGW(TAG, "Retomando automacao apos reinicio: estado=%d, tempo decorrido=%llds, watchdog restante=%llds",
+                 (int)auto_state, (long long)elapsed_in_state_s, (long long)remaining_wd_s);
+    }
+}
+
 static void automation_task(void *arg)
 {
     static bool prev_auto_enabled = false;
+    static int heartbeat_counter = 0;
+    const int HEARTBEAT_EVERY_TICKS = 600; // 600 * 500ms = 5 min
 
     while (1) {
         check_overpressure();
+
+        // "Sinal de vida" periodico na NVS - permite detectar quedas de
+        // energia mesmo durante estados longos (ex: aguardando o watchdog
+        // de ~110min), sem depender de uma transicao de estado acontecer.
+        if (++heartbeat_counter >= HEARTBEAT_EVERY_TICKS) {
+            heartbeat_counter = 0;
+            persist_automation_state();
+        }
 
         // Atraso centralizado de ligar a B2 (agendado em schedule_b2_start()).
         // Um unico ponto de checagem, nao-bloqueante, independente do estado atual.
@@ -899,6 +1205,16 @@ static const char index_html[] =
 ".totalbox span{font-size:11px;color:#8ea0b3;line-height:1.2;display:block;word-break:break-word;}"
 "#resetTotalsBtn{width:100%;margin-top:8px;padding:8px;font-size:12px;background:#26313f;color:#8ea0b3;"
 "border:none;border-radius:8px;cursor:pointer;}"
+".clockbar{max-width:420px;margin:0 auto 14px;padding:12px;border-radius:10px;background:#1a232e;"
+"font-size:13px;}"
+".clockbar .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}"
+".clockbar input[type=datetime-local]{flex:1;padding:6px;border-radius:6px;border:none;background:#26313f;"
+"color:#e8eef5;font-size:13px;}"
+".clockbar button{padding:8px 12px;font-size:12px;background:#3c3489;color:#fff;border:none;"
+"border-radius:8px;cursor:pointer;}"
+".outagewarn{max-width:420px;margin:0 auto 14px;padding:10px;border-radius:8px;background:#5c4a1f;"
+"color:#ffe5b3;font-size:12px;text-align:center;}"
+".outagewarn.hidden{display:none;}"
 ".grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:420px;margin:16px auto;}"
 "button{padding:22px 8px;font-size:14px;border:none;border-radius:12px;background:#26313f;color:#e8eef5;"
 "cursor:pointer;transition:background .15s;min-height:62px;display:flex;align-items:center;justify-content:center;}"
@@ -945,6 +1261,12 @@ static const char index_html[] =
 "<div class='totalbox'><b id='totalWater'>0.0</b><span>m3 (estimado) que entraram</span></div>"
 "</div>"
 "<button id='resetTotalsBtn' onclick='resetTotals()'>Zerar Totalizadores</button>"
+"<div class='clockbar'>"
+"<div class='row'><span>Hora do sistema:</span><b id='rtcNow'>--</b></div>"
+"<div class='row'><input type='datetime-local' id='rtcInput' step='1'>"
+"<button onclick='setRtc()'>Acertar Hora</button></div>"
+"</div>"
+"<div class='outagewarn hidden' id='outageWarn'></div>"
 "<div class='grid' id='grid'></div>"
 "<h2><span>Sensores</span><span class='dbg'><label class='switch' style='width:34px;height:20px'>"
 "<input type='checkbox' id='debugToggle' onchange='toggleDebug(this.checked)'>"
@@ -968,6 +1290,9 @@ static const char index_html[] =
 "const purgeCycleInput=document.getElementById('purgeCycleInput');"
 "const totalCyclesEl=document.getElementById('totalCycles');"
 "const totalWaterEl=document.getElementById('totalWater');"
+"const rtcNowEl=document.getElementById('rtcNow');"
+"const rtcInput=document.getElementById('rtcInput');"
+"const outageWarn=document.getElementById('outageWarn');"
 "let buttons=[];"
 "let checks=[];"
 "let remainingMs=0, lastFetch=0, totalMs=0;"
@@ -1009,6 +1334,12 @@ static const char index_html[] =
 "}"
 "async function resetTotals(){"
 "  await fetch('/api/totals/reset');"
+"  refresh();"
+"}"
+"async function setRtc(){"
+"  if(!rtcInput.value) return;"
+"  const epoch=Math.floor(new Date(rtcInput.value).getTime()/1000);"
+"  await fetch('/api/rtc/set?epoch='+epoch);"
 "  refresh();"
 "}"
 "async function toggleSensor(ch,checked){"
@@ -1070,6 +1401,16 @@ static const char index_html[] =
 "    if(document.activeElement!==purgeCycleInput){ purgeCycleInput.value=d.purge_cycle_min; }"
 "    totalCyclesEl.textContent=d.total_cycles;"
 "    totalWaterEl.textContent=d.total_water_in_m3.toFixed(1);"
+"    rtcNowEl.textContent=d.rtc_datetime+' UTC';"
+"    if(d.total_outages>0){"
+"      const ageMin=Math.round((d.rtc_epoch-d.last_outage_epoch)/60);"
+"      const durMin=Math.round(d.last_outage_duration_s/60);"
+"      outageWarn.textContent='Quedas de energia detectadas: '+d.total_outages+"
+"        ' | ultima ha '+ageMin+' min, durou aprox. '+durMin+' min';"
+"      outageWarn.classList.remove('hidden');"
+"    } else {"
+"      outageWarn.classList.add('hidden');"
+"    }"
 "    totalMs=d.state_total_ms||0;"
 "    remainingMs=d.state_remaining_ms||0;"
 "    lastFetch=Date.now();"
@@ -1093,7 +1434,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    char buf[2048];
+    char buf[2560];
     int len = snprintf(buf, sizeof(buf), "{\"labels\":[");
     for (int i = 0; i < NUM_RELAYS; i++) {
         len += snprintf(buf + len, sizeof(buf) - len, "\"%s\"%s",
@@ -1123,12 +1464,21 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     int64_t total_ms = state_total_ms();
     int64_t remaining_ms = state_remaining_ms();
 
+    int64_t rtc_epoch = epoch_now();
+    time_t rtc_tt = (time_t)rtc_epoch;
+    struct tm rtc_tm;
+    gmtime_r(&rtc_tt, &rtc_tm);
+    char rtc_str[24];
+    strftime(rtc_str, sizeof(rtc_str), "%Y-%m-%d %H:%M:%S", &rtc_tm);
+
     len += snprintf(buf + len, sizeof(buf) - len,
                      "],\"auto_enabled\":%s,\"auto_locked\":%s,\"fault\":%s,\"auto_state_text\":\"%s\","
                      "\"debug_mode\":%s,\"state_total_ms\":%lld,\"state_remaining_ms\":%lld,"
                      "\"num_cycles\":%d,\"estimated_m3_day\":%.1f,\"over_limit\":%s,"
                      "\"purge_cycle_min\":%d,"
-                     "\"total_cycles\":%lu,\"total_water_in_m3\":%.1f}",
+                     "\"total_cycles\":%lu,\"total_water_in_m3\":%.1f,"
+                     "\"rtc_epoch\":%lld,\"rtc_datetime\":\"%s\","
+                     "\"total_outages\":%lu,\"last_outage_duration_s\":%lld,\"last_outage_epoch\":%lld}",
                      auto_enabled ? "true" : "false",
                      is_auto_locked() ? "true" : "false",
                      fault_msg[0] ? "true" : "false",
@@ -1141,7 +1491,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                      (estimated_daily_m3() > DAILY_LIMIT_M3) ? "true" : "false",
                      (int)purge_cycle_minutes,
                      (unsigned long)total_cycles,
-                     total_water_in_m3);
+                     total_water_in_m3,
+                     (long long)rtc_epoch,
+                     rtc_str,
+                     (unsigned long)total_outages,
+                     (long long)last_outage_duration_s,
+                     (long long)last_outage_epoch);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, buf, len);
@@ -1267,6 +1622,31 @@ static esp_err_t totals_reset_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+static esp_err_t rtc_set_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    int64_t epoch = -1;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(query, "epoch", val, sizeof(val)) == ESP_OK) {
+            epoch = atoll(val);
+        }
+    }
+
+    if (epoch <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "epoch invalido", HTTPD_RESP_USE_STRLEN);
+    }
+
+    ds1302_set_epoch(epoch);
+    boot_epoch_offset = epoch - (esp_timer_get_time() / 1000000);
+    ESP_LOGI(TAG, "Hora ajustada pelo app: epoch=%lld", (long long)epoch);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t debug_mode_get_handler(httpd_req_t *req)
 {
     char query[32];
@@ -1333,7 +1713,7 @@ static httpd_handle_t start_webserver(void)
 {
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 28;
+    config.max_uri_handlers = 29;
     config.uri_match_fn = httpd_uri_match_wildcard;
 
     if (httpd_start(&server, &config) == ESP_OK) {
@@ -1348,6 +1728,7 @@ static httpd_handle_t start_webserver(void)
         httpd_uri_t cycles_uri     = { .uri = "/api/config/cycles", .method = HTTP_GET, .handler = config_cycles_get_handler };
         httpd_uri_t purge_cyc_uri  = { .uri = "/api/config/purge_cycle", .method = HTTP_GET, .handler = config_purge_cycle_get_handler };
         httpd_uri_t totals_reset_uri = { .uri = "/api/totals/reset", .method = HTTP_GET, .handler = totals_reset_get_handler };
+        httpd_uri_t rtc_set_uri    = { .uri = "/api/rtc/set",    .method = HTTP_GET, .handler = rtc_set_get_handler };
 
         httpd_register_uri_handler(server, &root_uri);
         httpd_register_uri_handler(server, &status_uri);
@@ -1360,6 +1741,7 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &cycles_uri);
         httpd_register_uri_handler(server, &purge_cyc_uri);
         httpd_register_uri_handler(server, &totals_reset_uri);
+        httpd_register_uri_handler(server, &rtc_set_uri);
 
         // URLs conhecidas de deteccao de captive portal (Android/iOS/Windows)
         static const char *captive_paths[] = {
@@ -1431,9 +1813,19 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     load_totals_from_nvs();
+    load_config_from_nvs();
+    load_outage_log_from_nvs();
 
     relays_init();
     boias_init();
+    ds1302_init();
+    boot_epoch_offset = ds1302_get_epoch() - (esp_timer_get_time() / 1000000);
+    ESP_LOGI(TAG, "Hora do RTC no boot: epoch=%lld", (long long)epoch_now());
+
+    // Precisa vir depois do RTC (usa epoch_now()) e depois de relays_init()
+    // (all_relays_off() la dentro), mas antes das tasks comecarem a rodar.
+    resume_or_detect_outage();
+
     xTaskCreate(boias_task, "boias_task", 3072, NULL, 5, NULL);
     xTaskCreate(automation_task, "automation_task", 4096, NULL, 5, NULL);
     wifi_init_softap();
