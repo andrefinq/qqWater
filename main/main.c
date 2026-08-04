@@ -3,32 +3,37 @@
  *
  * - ESP32 cria uma rede Wi-Fi propria (Access Point)
  * - Captive portal: DNS + redirecionamentos abrem a pagina sozinhos
- * ao conectar (igual wifi de aeroporto)
+ *   ao conectar (igual wifi de aeroporto)
  * - Servidor web com 8 boteos manuais (bloqueados durante automacao)
  * - Toggle "Modo Automatico" + botao "Parar Sistema"
  * - Modulo de rele optoacoplado, ativo em HIGH
- * - Leitura de 10 sensores digitais via mux CD74HC4067 / HW-178
- * (boias dos tanques, chaves de fluxo, feedback das bombas)
+ * - Leitura direta das 4 boias (nao usa mais o mux CD74HC4067)
  *
  * Reles (nesta ordem = canal 0 a 7):
- * GPIO13(V1) GPIO12(V2) GPIO14(V3) GPIO27(V4)
- * GPIO15(V5) GPIO2(V6)  GPIO4(B1)  GPIO16(B2)
+ *   GPIO13(V1) GPIO12(V2) GPIO14(V3) GPIO27(V4)
+ *   GPIO15(V5) GPIO2(V6)  GPIO4(B1)  GPIO16(B2)
  *
- * Mux de entrada (S0,S1,S2,S3,SIG):
- * GPIO21, GPIO19, GPIO18, GPIO5, GPIO17
+ * Boias (T1 alto, T1 baixo, T2 alto, T2 baixo, comum):
+ *   GPIO22, GPIO23, GPIO18, GPIO19, GPIO21
  *
  * ATENCAO DE HARDWARE:
- * GPIO12, GPIO2, GPIO15 e GPIO5 sao "strapping pins" do ESP32. O que
- * mais importa na pratica e o GPIO12 (tensao da flash no boot). Se
- * notar boot instavel, ligar um pull-down de 10k entre GPIO12 e GND.
+ *   GPIO12, GPIO2, GPIO15 e GPIO5 sao "strapping pins" do ESP32. O que
+ *   mais importa na pratica e o GPIO12 (tensao da flash no boot). Se
+ *   notar boot instavel, ligar um pull-down de 10k entre GPIO12 e GND.
  *
  * LOGICA DE AUTOMACAO (maquina de estados):
- * Start (tudo vazio): ativa watchdog de 110 min -> abre V1, liga B1,
- * enche T1 -> desliga B1/V1 -> aguarda 50 min -> abre V2, liga B1,
- * enche T2 -> desliga B1/V2 -> aguarda watchdog -> Ciclo A
- * Ciclo A: purga T1 (5min) -> esvazia T1 (V5) -> enche T1 -> aguarda 2h -> Ciclo B
- * Ciclo B: purga T2 (5min) -> esvazia T2 (V5) -> enche T2 -> aguarda 2h -> Ciclo A
- * Stop: purga T1+T2 (10min) -> esvazia os dois (V5) -> desliga tudo -> Modo Automatico OFF
+ *   Start (tudo vazio): ativa watchdog de 110 min -> abre V1, liga B1,
+ *     enche T1 -> desliga B1/V1 -> aguarda 50 min -> abre V2, liga B1,
+ *     enche T2 -> desliga B1/V2 -> aguarda watchdog -> Ciclo A
+ *   Ciclo A: purga T1 (5min) -> esvazia T1 (V5) -> enche T1 -> aguarda watchdog -> Ciclo B
+ *   Ciclo B: purga T2 (5min) -> esvazia T2 (V5) -> enche T2 -> aguarda watchdog -> Ciclo A
+ *   Stop: purga T1+T2 (10min) -> esvazia os dois (V5) -> desliga tudo -> Modo Automatico OFF
+ *
+ * BOMBA 2 (B2): V3/V4 sao valvulas esfera atuadas por motor eletrico,
+ *   que abrem devagar. B2 so liga 30s depois de abrir a purga/dreno,
+ *   pra evitar cavitacao enquanto a valvula ainda esta abrindo. Esse
+ *   atraso e agendado (nao-bloqueante) uma unica vez, na entrada da
+ *   purga - nao se repete na troca pra dreno, ja que B2 ja esta girando.
  */
 
 #include <string.h>
@@ -106,12 +111,6 @@ static void all_relays_off(void)
     }
 }
 
-static void relay_b2_delayed_on(void)
-{
-    vTaskDelay(pdMS_TO_TICKS(30000));
-    relay_write(IDX_B2, true);
-}
-
 static void relays_init(void)
 {
     for (int i = 0; i < NUM_RELAYS; i++) {
@@ -126,9 +125,9 @@ static void relays_init(void)
 // ---------------------------------------------------------------------
 // Leitura direta das boias nos pinos configurados
 // ---------------------------------------------------------------------
-#define BOIA_T1_ALTO_PIN GPIO_NUM_22
+#define BOIA_T1_ALTO_PIN  GPIO_NUM_22
 #define BOIA_T1_BAIXO_PIN GPIO_NUM_23
-#define BOIA_T2_ALTO_PIN GPIO_NUM_18
+#define BOIA_T2_ALTO_PIN  GPIO_NUM_18
 #define BOIA_T2_BAIXO_PIN GPIO_NUM_19
 #define BOIA_COMMON_PIN   GPIO_NUM_21
 
@@ -157,7 +156,7 @@ static const char *boia_labels[NUM_SENSOR_CHANNELS] = {
 // Comportamento real da boia:
 // - quando a boia boia, o circuito fica aberto e o pino fica flutuando (sem contato)
 // - quando a boia afunda, o contato fecha e o pino e puxado para baixo pelo pull-down
-// Para simplificar, consideramos "ativo/acionado" como o estado de flutuaçao (sem contato),
+// Para simplificar, consideramos "ativo/acionado" como o estado de flutuacao (sem contato),
 // e "normal" como o estado de contato fechado puxado para LOW.
 #define BOIA_FLOATING_LEVEL 0
 
@@ -306,6 +305,11 @@ static auto_state_t auto_state = AUTO_OFF;
 static int64_t state_enter_time_us = 0;
 static int64_t no_flow_since_us = -1;
 static char fault_msg[64] = "";
+
+// Agendamento nao-bloqueante do atraso de 30s antes de ligar a Bomba 2
+// (V3/V4 sao valvulas esfera motorizadas, abrem devagar - ligar B2 antes
+// de abrirem o suficiente causa cavitacao). Agendado 1x na entrada da
+// purga; o proprio loop da automacao verifica o prazo e liga a B2.
 static bool b2_start_pending = false;
 static int64_t b2_start_deadline_us = 0;
 
@@ -356,14 +360,23 @@ static void check_watchdog_fault(void)
     }
 }
 
+// Agenda o atraso nao-bloqueante de ligar a B2 (chamar 1x, na entrada da purga)
+static void schedule_b2_start(void)
+{
+    relay_write(IDX_B2, false);
+    b2_start_pending = true;
+    b2_start_deadline_us = esp_timer_get_time() + B2_START_DELAY_MS * 1000;
+    ESP_LOGI(TAG, "Atraso de %d s agendado para ligar B2", (int)(B2_START_DELAY_MS / 1000));
+}
+
 static void enter_state(auto_state_t new_state)
 {
     auto_state = new_state;
     state_enter_time_us = esp_timer_get_time();
-    b2_start_pending = false;
 
     switch (new_state) {
         case AUTO_OFF:
+            b2_start_pending = false;
             all_relays_off();
             break;
         case ST_START_FILL:
@@ -391,19 +404,11 @@ static void enter_state(auto_state_t new_state)
             activate_watchdog(get_cycle_watchdog_ms());
             relay_write(IDX_V3, true);
             relay_write(IDX_V6, true);
-            relay_b2_delayed_on();
+            schedule_b2_start();
             break;
         case A_DRAIN:
             relay_write(IDX_V5, true);
             relay_write(IDX_V6, false);
-            if (!relay_state[IDX_B2]) {
-                relay_write(IDX_B2, false);
-                b2_start_pending = true;
-                b2_start_deadline_us = esp_timer_get_time() + B2_START_DELAY_MS * 1000;
-                ESP_LOGI(TAG, "Atraso de %d s para ligar B2 (estado A_DRAIN)", (int)(B2_START_DELAY_MS / 1000));
-            } else {
-                relay_b2_delayed_on();
-            }
             break;
         case A_FILL:
             relay_write(IDX_V3, false);
@@ -422,19 +427,11 @@ static void enter_state(auto_state_t new_state)
             activate_watchdog(get_cycle_watchdog_ms());
             relay_write(IDX_V4, true);
             relay_write(IDX_V6, true);
-            relay_b2_delayed_on();
+            schedule_b2_start();
             break;
         case B_DRAIN:
             relay_write(IDX_V5, true);
             relay_write(IDX_V6, false);
-            if (!relay_state[IDX_B2]) {
-                relay_write(IDX_B2, false);
-                b2_start_pending = true;
-                b2_start_deadline_us = esp_timer_get_time() + B2_START_DELAY_MS * 1000;
-                ESP_LOGI(TAG, "Atraso de %d s para ligar B2 (estado B_DRAIN)", (int)(B2_START_DELAY_MS / 1000));
-            } else {
-                relay_b2_delayed_on();
-            }
             break;
         case B_FILL:
             relay_write(IDX_V4, false);
@@ -452,7 +449,7 @@ static void enter_state(auto_state_t new_state)
             relay_write(IDX_V3, true);
             relay_write(IDX_V4, true);
             relay_write(IDX_V6, true);
-            relay_b2_delayed_on();
+            schedule_b2_start();
             break;
         case STOP_DRAIN:
             relay_write(IDX_V5, true);
@@ -475,25 +472,25 @@ static const char *auto_state_text(void)
 {
     if (fault_msg[0]) return fault_msg;
     switch (auto_state) {
-        case AUTO_OFF:       return "Manual (automatico desligado)";
-        case ST_START_FILL:  return "Start - enchendo tanque 1";
-        case ST_START_DECANT:return "Start - decantando (aguardando 50min)";
-        case ST_START_FILL2: return "Start - enchendo tanque 2";
-        case ST_START_WAIT:  return "Start - aguardando watchdog para ciclo A";
-        case A_DECANT:       return "Ciclo A - decantando (aguardando 50min)";
-        case A_PURGE:        return "Ciclo A - purgando tanque 1";
-        case A_DRAIN:        return "Ciclo A - esvaziando tanque 1";
-        case A_FILL:         return "Ciclo A - enchendo tanque 1";
-        case A_WAIT:         return "Aguardando janela do ciclo - ciclo A concluido";
-        case B_DECANT:       return "Ciclo B - decantando (aguardando 50min)";
-        case B_PURGE:        return "Ciclo B - purgando tanque 2";
-        case B_DRAIN:        return "Ciclo B - esvaziando tanque 2";
-        case B_FILL:         return "Ciclo B - enchendo tanque 2";
-        case B_WAIT:         return "Aguardando janela do ciclo - ciclo B concluido";
-        case STOP_PURGE:     return "Parando sistema - purgando";
-        case STOP_DRAIN:     return "Parando sistema - esvaziando tanques";
-        case STOP_DONE:      return "Sistema parado";
-        default:             return "-";
+        case AUTO_OFF:        return "Manual (automatico desligado)";
+        case ST_START_FILL:   return "Start - enchendo tanque 1";
+        case ST_START_DECANT: return "Start - decantando (aguardando 50min)";
+        case ST_START_FILL2:  return "Start - enchendo tanque 2";
+        case ST_START_WAIT:   return "Start - aguardando watchdog para ciclo A";
+        case A_DECANT:        return "Ciclo A - decantando (aguardando 50min)";
+        case A_PURGE:         return "Ciclo A - purgando tanque 1";
+        case A_DRAIN:         return "Ciclo A - esvaziando tanque 1";
+        case A_FILL:          return "Ciclo A - enchendo tanque 1";
+        case A_WAIT:          return "Aguardando janela do ciclo - ciclo A concluido";
+        case B_DECANT:        return "Ciclo B - decantando (aguardando 50min)";
+        case B_PURGE:         return "Ciclo B - purgando tanque 2";
+        case B_DRAIN:         return "Ciclo B - esvaziando tanque 2";
+        case B_FILL:          return "Ciclo B - enchendo tanque 2";
+        case B_WAIT:          return "Aguardando janela do ciclo - ciclo B concluido";
+        case STOP_PURGE:      return "Parando sistema - purgando";
+        case STOP_DRAIN:      return "Parando sistema - esvaziando tanques";
+        case STOP_DONE:       return "Sistema parado";
+        default:              return "-";
     }
 }
 
@@ -502,6 +499,7 @@ static void trigger_fault(const char *msg)
     strncpy(fault_msg, msg, sizeof(fault_msg) - 1);
     fault_msg[sizeof(fault_msg) - 1] = '\0';
     ESP_LOGE(TAG, "FALHA: %s", msg);
+    b2_start_pending = false;
     all_relays_off();
     auto_enabled = false;
     stop_requested = false;
@@ -668,6 +666,13 @@ static void automation_task(void *arg)
     while (1) {
         check_overpressure();
 
+        // Atraso centralizado de ligar a B2 (agendado em schedule_b2_start()).
+        // Um unico ponto de checagem, nao-bloqueante, independente do estado atual.
+        if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
+            b2_start_pending = false;
+            relay_write(IDX_B2, true);
+        }
+
         if (skip_requested) {
             skip_requested = false;
             // "Pular" so acelera o relogio do timer atual (deixa ~2s restando).
@@ -677,8 +682,6 @@ static void automation_task(void *arg)
                 int64_t fast_forward_ms = total - 2000;
                 if (fast_forward_ms < 0) fast_forward_ms = 0;
                 state_enter_time_us = esp_timer_get_time() - (fast_forward_ms * 1000);
-                // Se o estado atual depende do watchdog (as esperas), adianta
-                // o proprio deadline junto, senao ele ficaria travado no valor antigo.
                 switch (auto_state) {
                     case ST_START_WAIT:
                     case A_WAIT:
@@ -739,18 +742,10 @@ static void automation_task(void *arg)
                 break;
             case A_PURGE:
                 check_watchdog_fault();
-                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
-                    relay_b2_delayed_on();
-                    b2_start_pending = false;
-                }
                 if (elapsed_ms() >= purge_cycle_ms()) enter_state(A_DRAIN);
                 break;
             case A_DRAIN:
                 check_watchdog_fault();
-                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
-                    relay_b2_delayed_on();
-                    b2_start_pending = false;
-                }
                 if (tank_low(1) || !sensor_available(MIDX_T1_BAIXO)) enter_state(A_FILL);
                 break;
             case A_FILL:
@@ -771,18 +766,10 @@ static void automation_task(void *arg)
                 break;
             case B_PURGE:
                 check_watchdog_fault();
-                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
-                    relay_b2_delayed_on();
-                    b2_start_pending = false;
-                }
                 if (elapsed_ms() >= purge_cycle_ms()) enter_state(B_DRAIN);
                 break;
             case B_DRAIN:
                 check_watchdog_fault();
-                if (b2_start_pending && esp_timer_get_time() >= b2_start_deadline_us) {
-                    relay_b2_delayed_on();
-                    b2_start_pending = false;
-                }
                 if (tank_low(2) || !sensor_available(MIDX_T2_BAIXO)) enter_state(B_FILL);
                 break;
             case B_FILL:
