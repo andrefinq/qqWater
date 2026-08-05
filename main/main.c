@@ -257,9 +257,9 @@ static inline bool tank_low(int tank)
 // RTC DS1302 (mantem a hora real durante quedas de energia)
 // Protocolo proprio de 3 fios (nao e I2C nem SPI padrao).
 // ---------------------------------------------------------------------
-#define DS1302_CLK_PIN GPIO_NUM_25
-#define DS1302_DAT_PIN GPIO_NUM_26
-#define DS1302_RST_PIN GPIO_NUM_33
+#define DS1302_CLK_PIN GPIO_NUM_26
+#define DS1302_DAT_PIN GPIO_NUM_33
+#define DS1302_RST_PIN GPIO_NUM_32
 
 #define DS1302_REG_SECONDS 0x80
 #define DS1302_REG_MINUTES 0x82
