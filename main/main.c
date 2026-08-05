@@ -34,10 +34,21 @@
  *   pra evitar cavitacao enquanto a valvula ainda esta abrindo. Esse
  *   atraso e agendado (nao-bloqueante) uma unica vez, na entrada da
  *   purga - nao se repete na troca pra dreno, ja que B2 ja esta girando.
+ *
+ * PERSISTENCIA NA NVS:
+ *   - "Modo Automatico" (liga/desliga): apos queda de energia, o boot
+ *     sempre comeca em AUTO_OFF; se estava ligado, o loop de automacao
+ *     dispara um Start normal sozinho (nao retoma o estado interno).
+ *   - Volume de cada tanque e volume de purga (ajustaveis pelo app).
+ *
+ * ESTIMATIVAS DE AGUA:
+ *   - "agua consumida/dia" = ciclos/dia * media dos volumes dos tanques.
+ *   - "agua produzida/dia" = consumida - (ciclos/dia * volume de purga).
  */
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -268,10 +279,24 @@ static inline bool tank_low(int tank)
 #define B2_START_DELAY_MS (30LL * 1000)
 #define DAY_MS           (24LL * 60 * 60 * 1000)
 
-#define TANK_VOLUME_M3    1.6
 #define DAILY_LIMIT_M3    18.0
 #define MIN_CYCLES_PER_DAY 1
 #define MAX_CYCLES_PER_DAY 28   // acima disso o watchdog (1440/n - 50) fica <= 0
+
+// Volume de cada tanque (ajustavel pelo app - a boia raramente para em
+// exatos 2 m3, entao esse campo permite corrigir a estimativa sem
+// precisar recompilar/reflashear o firmware).
+#define TANK_VOLUME_MIN_M3 0.1
+#define TANK_VOLUME_MAX_M3 10.0
+static volatile double tank1_volume_m3 = 1.6;
+static volatile double tank2_volume_m3 = 1.6;
+
+// Volume perdido/descartado a cada purga (sedimento + agua). Usado so
+// para estimar a "agua produzida" (consumida - purgada); nao afeta a
+// automacao em si.
+#define PURGE_VOLUME_MIN_M3 0.0
+#define PURGE_VOLUME_MAX_M3 5.0
+static volatile double purge_volume_m3 = 0.1;
 
 typedef enum {
     AUTO_OFF = 0,
@@ -294,6 +319,11 @@ typedef enum {
     STOP_DONE,
 } auto_state_t;
 
+// auto_enabled e persistido na NVS (so o liga/desliga - nao o estado
+// interno da maquina). Depois de uma queda de energia o boot sempre
+// comeca em AUTO_OFF; se auto_enabled volta true da NVS, o loop de
+// automacao entende isso como "religar" e dispara um Start normal
+// (ST_START_FILL), igual a apertar o toggle manualmente.
 static volatile bool auto_enabled = false;
 static volatile bool stop_requested = false;
 static volatile bool skip_requested = false;
@@ -353,6 +383,7 @@ static inline bool watchdog_expired(void)
 // por um watchdog - nao chamar durante os estados de espera (*_WAIT),
 // onde o watchdog expirar e o comportamento normal, nao uma falha.
 static void trigger_fault(const char *msg); // definida mais abaixo
+static void set_auto_enabled(bool en);      // definida mais abaixo (grava na NVS)
 static void check_watchdog_fault(void)
 {
     if (watchdog_expired()) {
@@ -460,7 +491,7 @@ static void enter_state(auto_state_t new_state)
             relay_write(IDX_V4, false);
             relay_write(IDX_V5, false);
             relay_write(IDX_B2, false);
-            auto_enabled = false;
+            set_auto_enabled(false);
             stop_requested = false;
             enter_state(AUTO_OFF);
             return;
@@ -501,7 +532,7 @@ static void trigger_fault(const char *msg)
     ESP_LOGE(TAG, "FALHA: %s", msg);
     b2_start_pending = false;
     all_relays_off();
-    auto_enabled = false;
+    set_auto_enabled(false);
     stop_requested = false;
     auto_state = AUTO_OFF;
     state_enter_time_us = esp_timer_get_time();
@@ -582,14 +613,23 @@ static bool set_num_cycles_per_day(int32_t n)
 {
     if (n < MIN_CYCLES_PER_DAY || n > MAX_CYCLES_PER_DAY) return false;
     num_cycles_per_day = n;
-    ESP_LOGI(TAG, "Ciclos/dia configurado para %d (producao estimada %.1f m3/dia)",
-             (int)n, n * TANK_VOLUME_M3);
+    ESP_LOGI(TAG, "Ciclos/dia configurado para %d", (int)n);
     return true;
 }
 
-static double estimated_daily_m3(void)
+// Estimativa de agua consumida do poco por dia. Os ciclos alternam entre
+// tanque 1 e 2, entao usa a media dos dois volumes configurados.
+static double estimated_consumed_daily_m3(void)
 {
-    return num_cycles_per_day * TANK_VOLUME_M3;
+    return num_cycles_per_day * ((tank1_volume_m3 + tank2_volume_m3) / 2.0);
+}
+
+// Estimativa de agua "produzida" (aproveitavel) por dia: consumida menos
+// o que e descartado na purga a cada ciclo (1 purga por ciclo A ou B).
+static double estimated_produced_daily_m3(void)
+{
+    double produced = estimated_consumed_daily_m3() - num_cycles_per_day * purge_volume_m3;
+    return produced > 0 ? produced : 0.0;
 }
 
 static bool set_purge_cycle_minutes(int32_t min)
@@ -597,6 +637,28 @@ static bool set_purge_cycle_minutes(int32_t min)
     if (min < MIN_PURGE_MIN || min > MAX_PURGE_MIN) return false;
     purge_cycle_minutes = min;
     ESP_LOGI(TAG, "Tempo de purga (ciclo) configurado para %d min", (int)min);
+    return true;
+}
+
+static bool set_tank_volume(int tank, double m3)
+{
+    if (m3 < TANK_VOLUME_MIN_M3 || m3 > TANK_VOLUME_MAX_M3) return false;
+    if (tank == 1) {
+        tank1_volume_m3 = m3;
+    } else if (tank == 2) {
+        tank2_volume_m3 = m3;
+    } else {
+        return false;
+    }
+    ESP_LOGI(TAG, "Volume do tanque %d configurado para %.2f m3", tank, m3);
+    return true;
+}
+
+static bool set_purge_volume(double m3)
+{
+    if (m3 < PURGE_VOLUME_MIN_M3 || m3 > PURGE_VOLUME_MAX_M3) return false;
+    purge_volume_m3 = m3;
+    ESP_LOGI(TAG, "Volume de purga configurado para %.2f m3", m3);
     return true;
 }
 
@@ -611,6 +673,11 @@ static void load_totals_from_nvs(void)
 
     uint32_t cycles = 0;
     uint32_t water_x10 = 0;
+    uint32_t tank1_x100 = 0;
+    uint32_t tank2_x100 = 0;
+    uint32_t purge_x100 = 0;
+    uint8_t  auto_en = 0;
+
     err = nvs_get_u32(handle, "tot_cycles", &cycles);
     if (err == ESP_OK) {
         total_cycles = cycles;
@@ -619,10 +686,31 @@ static void load_totals_from_nvs(void)
     if (err == ESP_OK) {
         total_water_in_m3 = (double)water_x10 / 10.0;
     }
+    err = nvs_get_u32(handle, "tank1_vol_x100", &tank1_x100);
+    if (err == ESP_OK) {
+        tank1_volume_m3 = (double)tank1_x100 / 100.0;
+    }
+    err = nvs_get_u32(handle, "tank2_vol_x100", &tank2_x100);
+    if (err == ESP_OK) {
+        tank2_volume_m3 = (double)tank2_x100 / 100.0;
+    }
+    err = nvs_get_u32(handle, "purge_vol_x100", &purge_x100);
+    if (err == ESP_OK) {
+        purge_volume_m3 = (double)purge_x100 / 100.0;
+    }
+    err = nvs_get_u8(handle, "auto_en", &auto_en);
+    if (err == ESP_OK) {
+        // Nao entra em ST_START_FILL aqui diretamente - so restaura a flag.
+        // O loop de automacao (automation_task), ao ver auto_enabled=true
+        // com auto_state=AUTO_OFF, dispara um Start normal sozinho.
+        auto_enabled = (auto_en != 0);
+    }
 
     nvs_close(handle);
-    ESP_LOGI(TAG, "Totalizadores carregados da NVS: ciclos=%lu, agua=%.1f m3",
-             (unsigned long)total_cycles, total_water_in_m3);
+    ESP_LOGI(TAG, "NVS carregada: ciclos=%lu, agua=%.1f m3, tanque1=%.2f m3, tanque2=%.2f m3, "
+             "purga=%.2f m3, automatico=%s",
+             (unsigned long)total_cycles, total_water_in_m3, tank1_volume_m3, tank2_volume_m3,
+             purge_volume_m3, auto_enabled ? "estava LIGADO" : "estava desligado");
 }
 
 static void save_totals_to_nvs(void)
@@ -649,6 +737,45 @@ static void save_totals_to_nvs(void)
     }
 
     nvs_close(handle);
+}
+
+// Grava so a flag de liga/desliga do automatico (chamada com mais
+// frequencia que save_totals_to_nvs, entao fica separada).
+static void save_auto_enabled_to_nvs(bool en)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao abrir NVS para gravar auto_enabled: %s", esp_err_to_name(err));
+        return;
+    }
+    nvs_set_u8(handle, "auto_en", en ? 1 : 0);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// Grava os campos de volume configuraveis (tanques + purga) na NVS.
+static void save_volumes_to_nvs(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao abrir NVS para gravar volumes: %s", esp_err_to_name(err));
+        return;
+    }
+    nvs_set_u32(handle, "tank1_vol_x100", (uint32_t)(tank1_volume_m3 * 100.0 + 0.5));
+    nvs_set_u32(handle, "tank2_vol_x100", (uint32_t)(tank2_volume_m3 * 100.0 + 0.5));
+    nvs_set_u32(handle, "purge_vol_x100", (uint32_t)(purge_volume_m3 * 100.0 + 0.5));
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// Usado no toggle manual e sempre que o sistema muda auto_enabled sozinho
+// (fim de sequencia de parada, falha). Mantem a flag persistida em dia.
+static void set_auto_enabled(bool en)
+{
+    auto_enabled = en;
+    save_auto_enabled_to_nvs(en);
 }
 
 static void reset_totals(void)
@@ -717,7 +844,7 @@ static void automation_task(void *arg)
                 check_dryrun();
                 check_watchdog_fault();
                 if (tank_high(1)) {
-                    total_water_in_m3 += TANK_VOLUME_M3;
+                    total_water_in_m3 += tank1_volume_m3;
                     save_totals_to_nvs();
                     enter_state(ST_START_DECANT);
                 }
@@ -729,7 +856,7 @@ static void automation_task(void *arg)
                 check_dryrun();
                 check_watchdog_fault();
                 if (tank_high(2)) {
-                    total_water_in_m3 += TANK_VOLUME_M3;
+                    total_water_in_m3 += tank2_volume_m3;
                     save_totals_to_nvs();
                     enter_state(ST_START_WAIT);
                 }
@@ -752,7 +879,7 @@ static void automation_task(void *arg)
                 check_dryrun();
                 check_watchdog_fault();
                 if (tank_high(1)) {
-                    total_water_in_m3 += TANK_VOLUME_M3;
+                    total_water_in_m3 += tank1_volume_m3;
                     total_cycles++;
                     save_totals_to_nvs();
                     enter_state(A_WAIT);
@@ -776,7 +903,7 @@ static void automation_task(void *arg)
                 check_dryrun();
                 check_watchdog_fault();
                 if (tank_high(2)) {
-                    total_water_in_m3 += TANK_VOLUME_M3;
+                    total_water_in_m3 += tank2_volume_m3;
                     total_cycles++;
                     save_totals_to_nvs();
                     enter_state(B_WAIT);
@@ -940,6 +1067,21 @@ static const char index_html[] =
 "<input type='number' id='purgeCycleInput' min='1' max='60' value='5' onchange='setPurgeCycle(this.value)'>"
 "<span></span>"
 "</div>"
+"<div class='purgebar'>"
+"<span>Volume tanque 1 (m3):</span>"
+"<input type='number' id='tank1VolInput' min='0.1' max='10' step='0.01' value='1.6' onchange='setTankVolume(1,this.value)'>"
+"<span></span>"
+"</div>"
+"<div class='purgebar'>"
+"<span>Volume tanque 2 (m3):</span>"
+"<input type='number' id='tank2VolInput' min='0.1' max='10' step='0.01' value='1.6' onchange='setTankVolume(2,this.value)'>"
+"<span></span>"
+"</div>"
+"<div class='purgebar'>"
+"<span>Volume de purga (m3):</span>"
+"<input type='number' id='purgeVolInput' min='0' max='5' step='0.01' value='0.1' onchange='setPurgeVolume(this.value)'>"
+"<span id='producedInfo'></span>"
+"</div>"
 "<div class='totalsbar'>"
 "<div class='totalbox'><b id='totalCycles'>0</b><span>ciclos completos</span></div>"
 "<div class='totalbox'><b id='totalWater'>0.0</b><span>m3 (estimado) que entraram</span></div>"
@@ -966,6 +1108,10 @@ static const char index_html[] =
 "const cyclesInfo=document.getElementById('cyclesInfo');"
 "const limitWarn=document.getElementById('limitWarn');"
 "const purgeCycleInput=document.getElementById('purgeCycleInput');"
+"const tank1VolInput=document.getElementById('tank1VolInput');"
+"const tank2VolInput=document.getElementById('tank2VolInput');"
+"const purgeVolInput=document.getElementById('purgeVolInput');"
+"const producedInfo=document.getElementById('producedInfo');"
 "const totalCyclesEl=document.getElementById('totalCycles');"
 "const totalWaterEl=document.getElementById('totalWater');"
 "let buttons=[];"
@@ -1005,6 +1151,14 @@ static const char index_html[] =
 "}"
 "async function setPurgeCycle(min){"
 "  await fetch('/api/config/purge_cycle?min='+min);"
+"  refresh();"
+"}"
+"async function setTankVolume(tank,m3){"
+"  await fetch('/api/config/tank_volume?tank='+tank+'&m3='+m3);"
+"  refresh();"
+"}"
+"async function setPurgeVolume(m3){"
+"  await fetch('/api/config/purge_volume?m3='+m3);"
 "  refresh();"
 "}"
 "async function resetTotals(){"
@@ -1065,9 +1219,13 @@ static const char index_html[] =
 "    stopBtn.disabled=!d.auto_locked;"
 "    skipBtn.disabled=!d.auto_locked;"
 "    if(document.activeElement!==cyclesInput){ cyclesInput.value=d.num_cycles; }"
-"    cyclesInfo.textContent='('+d.estimated_m3_day.toFixed(1)+' m3/dia estimado)';"
+"    cyclesInfo.textContent='('+d.estimated_m3_day.toFixed(1)+' m3/dia consumido)';"
 "    limitWarn.classList.toggle('hidden', !d.over_limit);"
 "    if(document.activeElement!==purgeCycleInput){ purgeCycleInput.value=d.purge_cycle_min; }"
+"    if(document.activeElement!==tank1VolInput){ tank1VolInput.value=d.tank1_volume_m3; }"
+"    if(document.activeElement!==tank2VolInput){ tank2VolInput.value=d.tank2_volume_m3; }"
+"    if(document.activeElement!==purgeVolInput){ purgeVolInput.value=d.purge_volume_m3; }"
+"    producedInfo.textContent='('+d.estimated_produced_m3_day.toFixed(1)+' m3/dia produzido)';"
 "    totalCyclesEl.textContent=d.total_cycles;"
 "    totalWaterEl.textContent=d.total_water_in_m3.toFixed(1);"
 "    totalMs=d.state_total_ms||0;"
@@ -1126,8 +1284,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     len += snprintf(buf + len, sizeof(buf) - len,
                      "],\"auto_enabled\":%s,\"auto_locked\":%s,\"fault\":%s,\"auto_state_text\":\"%s\","
                      "\"debug_mode\":%s,\"state_total_ms\":%lld,\"state_remaining_ms\":%lld,"
-                     "\"num_cycles\":%d,\"estimated_m3_day\":%.1f,\"over_limit\":%s,"
-                     "\"purge_cycle_min\":%d,"
+                     "\"num_cycles\":%d,\"estimated_m3_day\":%.1f,\"estimated_produced_m3_day\":%.1f,"
+                     "\"over_limit\":%s,"
+                     "\"purge_cycle_min\":%d,\"tank1_volume_m3\":%.2f,\"tank2_volume_m3\":%.2f,"
+                     "\"purge_volume_m3\":%.2f,"
                      "\"total_cycles\":%lu,\"total_water_in_m3\":%.1f}",
                      auto_enabled ? "true" : "false",
                      is_auto_locked() ? "true" : "false",
@@ -1137,9 +1297,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                      (long long)total_ms,
                      (long long)remaining_ms,
                      (int)num_cycles_per_day,
-                     estimated_daily_m3(),
-                     (estimated_daily_m3() > DAILY_LIMIT_M3) ? "true" : "false",
+                     estimated_consumed_daily_m3(),
+                     estimated_produced_daily_m3(),
+                     (estimated_consumed_daily_m3() > DAILY_LIMIT_M3) ? "true" : "false",
                      (int)purge_cycle_minutes,
+                     tank1_volume_m3,
+                     tank2_volume_m3,
+                     purge_volume_m3,
                      (unsigned long)total_cycles,
                      total_water_in_m3);
 
@@ -1196,7 +1360,7 @@ static esp_err_t auto_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, "parametro invalido", HTTPD_RESP_USE_STRLEN);
     }
 
-    auto_enabled = (state == 1);
+    set_auto_enabled(state == 1);
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1255,6 +1419,56 @@ static esp_err_t config_purge_cycle_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, "tempo de purga invalido (faixa permitida: 1 a 60 min)",
                                 HTTPD_RESP_USE_STRLEN);
     }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t config_tank_volume_get_handler(httpd_req_t *req)
+{
+    char query[64];
+    int tank = -1;
+    double m3 = -1.0;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(query, "tank", val, sizeof(val)) == ESP_OK) {
+            tank = atoi(val);
+        }
+        if (httpd_query_key_value(query, "m3", val, sizeof(val)) == ESP_OK) {
+            m3 = atof(val);
+        }
+    }
+
+    if (!set_tank_volume(tank, m3)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "parametros invalidos (tank=1 ou 2, m3 entre 0.1 e 10.0)",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+    save_volumes_to_nvs();
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t config_purge_volume_get_handler(httpd_req_t *req)
+{
+    char query[32];
+    double m3 = -1.0;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(query, "m3", val, sizeof(val)) == ESP_OK) {
+            m3 = atof(val);
+        }
+    }
+
+    if (!set_purge_volume(m3)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_send(req, "volume de purga invalido (entre 0.0 e 5.0 m3)",
+                                HTTPD_RESP_USE_STRLEN);
+    }
+    save_volumes_to_nvs();
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1347,6 +1561,8 @@ static httpd_handle_t start_webserver(void)
         httpd_uri_t debug_set_uri  = { .uri = "/api/debug/set",  .method = HTTP_GET, .handler = debug_set_get_handler };
         httpd_uri_t cycles_uri     = { .uri = "/api/config/cycles", .method = HTTP_GET, .handler = config_cycles_get_handler };
         httpd_uri_t purge_cyc_uri  = { .uri = "/api/config/purge_cycle", .method = HTTP_GET, .handler = config_purge_cycle_get_handler };
+        httpd_uri_t tank_vol_uri  = { .uri = "/api/config/tank_volume", .method = HTTP_GET, .handler = config_tank_volume_get_handler };
+        httpd_uri_t purge_vol_uri = { .uri = "/api/config/purge_volume", .method = HTTP_GET, .handler = config_purge_volume_get_handler };
         httpd_uri_t totals_reset_uri = { .uri = "/api/totals/reset", .method = HTTP_GET, .handler = totals_reset_get_handler };
 
         httpd_register_uri_handler(server, &root_uri);
@@ -1359,6 +1575,8 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &debug_set_uri);
         httpd_register_uri_handler(server, &cycles_uri);
         httpd_register_uri_handler(server, &purge_cyc_uri);
+        httpd_register_uri_handler(server, &tank_vol_uri);
+        httpd_register_uri_handler(server, &purge_vol_uri);
         httpd_register_uri_handler(server, &totals_reset_uri);
 
         // URLs conhecidas de deteccao de captive portal (Android/iOS/Windows)
