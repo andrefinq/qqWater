@@ -268,7 +268,7 @@ static inline bool tank_low(int tank)
 #define B2_START_DELAY_MS (30LL * 1000)
 #define DAY_MS           (24LL * 60 * 60 * 1000)
 
-#define TANK_VOLUME_M3    2.0
+#define TANK_VOLUME_M3    1.6
 #define DAILY_LIMIT_M3    18.0
 #define MIN_CYCLES_PER_DAY 1
 #define MAX_CYCLES_PER_DAY 28   // acima disso o watchdog (1440/n - 50) fica <= 0
