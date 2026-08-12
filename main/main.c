@@ -40,6 +40,9 @@
  *     sempre comeca em AUTO_OFF; se estava ligado, o loop de automacao
  *     dispara um Start normal sozinho (nao retoma o estado interno).
  *   - Volume de cada tanque e volume de purga (ajustaveis pelo app).
+ *   - Numero de ciclos/dia e tempo de purga do ciclo (ajustaveis pelo
+ *     app). Sao lidos de volta no boot com validacao de faixa, para que
+ *     uma queda de energia nao devolva a automacao aos valores default.
  *
  * ESTIMATIVAS DE AGUA:
  *   - "agua consumida/dia" = ciclos/dia * media dos volumes dos tanques.
@@ -49,6 +52,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -164,16 +169,47 @@ static const char *boia_labels[NUM_SENSOR_CHANNELS] = {
 #define MIDX_T2_ALTO 2
 #define MIDX_T2_BAIXO 3
 
-// Comportamento real da boia:
-// - quando a boia boia, o circuito fica aberto e o pino fica flutuando (sem contato)
-// - quando a boia afunda, o contato fecha e o pino e puxado para baixo pelo pull-down
-// Para simplificar, consideramos "ativo/acionado" como o estado de flutuacao (sem contato),
-// e "normal" como o estado de contato fechado puxado para LOW.
-#define BOIA_FLOATING_LEVEL 0
+// ---------------------------------------------------------------------
+// POLARIDADE DAS BOIAS - LEIA ANTES DE MEXER
+// ---------------------------------------------------------------------
+// Ligacao eletrica usada por este firmware:
+//   - BOIA_COMMON_PIN e SAIDA em nivel ALTO (3.3 V)
+//   - cada pino de boia e ENTRADA com PULL-DOWN interno
+//   - a boia (chave de nivel) liga o comum ao pino correspondente
+//
+// Logo, o nivel lido no pino depende SO do contato da chave:
+//   contato FECHADO -> pino recebe os 3.3 V do comum  -> le 1 (HIGH)
+//   contato ABERTO  -> pull-down interno domina       -> le 0 (LOW)
+//
+// (Atencao: nao existe pull-up nesta montagem. Comentarios de versoes
+//  antigas do firmware descreviam a ligacao invertida, de quando o comum
+//  ia ao GND e os pinos usavam pull-up. Se voce mudar a fiacao de volta
+//  para aquele esquema, e obrigatorio inverter BOIA_LEVEL_WHEN_UP.)
+//
+// Comportamento das boias efetivamente instaladas (CONFERIDO no hardware):
+//   boia LEVANTADA (com agua) -> contato ABERTO  -> pull-down -> le 0
+//   boia CAIDA     (vazio)    -> contato FECHADO -> comum     -> le 1
+// Ou seja, sao chaves que ABREM ao subir (tipo NF, fechadas com a boia
+// caida). Dai BOIA_LEVEL_WHEN_UP = 0.
+//
+// Se um dia trocar o modelo da boia (por uma que FECHA ao subir) ou voltar
+// a fiacao para comum no GND + pull-up, basta mudar este define para 1 -
+// e o unico ponto do codigo que depende da polaridade.
+//
+// Teste rapido no banco depois de qualquer troca de boia ou de fiacao:
+// erguer a boia na mao com o modo debug DESLIGADO; o log deve mostrar
+// "Boia N -> ACIONADA" com ela erguida e "normal" ao soltar. Invertido,
+// A_DRAIN/B_DRAIN leem tanque vazio com o tanque cheio.
+#define BOIA_LEVEL_WHEN_UP 0
 
+// boia_state[i] = true  -> boia LEVANTADA (ha agua naquela altura) = "ACIONADA"
+// boia_state[i] = false -> boia CAIDA (sem agua naquela altura)    = "normal"
 static bool boia_state[NUM_SENSOR_CHANNELS] = {false};
 static int  boia_debounce_count[NUM_SENSOR_CHANNELS] = {0};
 static bool boia_last_raw[NUM_SENSOR_CHANNELS] = {false};
+// Reservado para deteccao de boia desconectada/em falha. Hoje nada escreve
+// false aqui - as guardas !sensor_available() na automacao existem para
+// quando essa deteccao for implementada.
 static bool boia_available[NUM_SENSOR_CHANNELS] = {true, true, true, true};
 #define BOIA_DEBOUNCE_THRESHOLD 3
 #define BOIA_POLL_PERIOD_MS 50
@@ -199,21 +235,21 @@ static void boias_poll_once(void)
 {
     for (int ch = 0; ch < NUM_SENSOR_CHANNELS; ch++) {
         int raw_level = gpio_get_level(boia_pins[ch]);
-        bool raw_triggered = (raw_level == BOIA_FLOATING_LEVEL);
+        bool raw_up = (raw_level == BOIA_LEVEL_WHEN_UP);
 
-        if (raw_triggered == boia_last_raw[ch]) {
+        if (raw_up == boia_last_raw[ch]) {
             if (boia_debounce_count[ch] < BOIA_DEBOUNCE_THRESHOLD) {
                 boia_debounce_count[ch]++;
             }
         } else {
-            boia_last_raw[ch] = raw_triggered;
+            boia_last_raw[ch] = raw_up;
             boia_debounce_count[ch] = 0;
         }
 
-        if (boia_debounce_count[ch] >= BOIA_DEBOUNCE_THRESHOLD && boia_state[ch] != raw_triggered) {
-            boia_state[ch] = raw_triggered;
+        if (boia_debounce_count[ch] >= BOIA_DEBOUNCE_THRESHOLD && boia_state[ch] != raw_up) {
+            boia_state[ch] = raw_up;
             ESP_LOGI(TAG, "Boia %d (%s) -> %s", ch, boia_labels[ch],
-                     raw_triggered ? "ACIONADA" : "normal");
+                     raw_up ? "ACIONADA" : "normal");
         }
     }
 }
@@ -238,6 +274,7 @@ static inline bool sensor_available(int ch)
     return (ch >= 0 && ch < NUM_SENSOR_CHANNELS && boia_available[ch]);
 }
 
+// true = boia levantada (ha agua naquela altura)
 static inline bool effective_sensor_state(int ch)
 {
     if (ch < 0 || ch >= NUM_SENSOR_CHANNELS) return false;
@@ -245,15 +282,19 @@ static inline bool effective_sensor_state(int ch)
     return debug_mode ? debug_sensor_state[ch] : boia_state[ch];
 }
 
-static inline bool tank_high(int tank) { return tank == 1 ? effective_sensor_state(MIDX_T1_ALTO) : effective_sensor_state(MIDX_T2_ALTO); }
+// Tanque cheio = boia de cima levantada.
+static inline bool tank_high(int tank)
+{
+    return tank == 1 ? effective_sensor_state(MIDX_T1_ALTO) : effective_sensor_state(MIDX_T2_ALTO);
+}
 
-// A boia de fundo (baixo) e do tipo NF/NC: fica fechada (GND) sempre que
-// ha agua acima dela (enchendo, cheio) e SO abre (libera o pull-up, HIGH)
-// quando o tanque esvazia completamente abaixo dela. Ou seja, e o
-// contrario da boia de alto - por isso o sinal e invertido aqui.
-//   alto=HIGH, baixo=HIGH -> vazio        (tank_low = true)
-//   alto=HIGH, baixo=GND  -> enchendo/esvaziando (tank_low = false)
-//   alto=GND,  baixo=GND  -> cheio        (tank_low = false)
+// Tanque vazio = boia de baixo CAIDA (sem agua nem no fundo). Por isso a
+// negacao: effective_sensor_state() significa "levantada", e a boia de
+// fundo fica levantada em qualquer nivel acima dela (enchendo ou cheio).
+// Resumo dos tres estados possiveis:
+//   alto caida,     baixo caida     -> vazio                (tank_low = true)
+//   alto caida,     baixo levantada -> enchendo/esvaziando  (tank_low = false)
+//   alto levantada, baixo levantada -> cheio                (tank_low = false)
 static inline bool tank_low(int tank)
 {
     int idx = (tank == 1) ? MIDX_T1_BAIXO : MIDX_T2_BAIXO;
@@ -327,8 +368,8 @@ typedef enum {
 static volatile bool auto_enabled = false;
 static volatile bool stop_requested = false;
 static volatile bool skip_requested = false;
-static volatile int32_t num_cycles_per_day = 10; // configuravel pelo app
-static volatile int32_t purge_cycle_minutes = 1;  // purga do Ciclo A/B, configuravel
+static volatile int32_t num_cycles_per_day = 10; // configuravel pelo app, persistido na NVS
+static volatile int32_t purge_cycle_minutes = 1;  // purga do Ciclo A/B, persistido na NVS
 static volatile uint32_t total_cycles = 0;        // ciclos A/B completos desde o boot
 static volatile double total_water_in_m3 = 0.0;   // agua estimada que entrou (poco -> tanque)
 static auto_state_t auto_state = AUTO_OFF;
@@ -662,6 +703,19 @@ static bool set_purge_volume(double m3)
     return true;
 }
 
+// ---------------------------------------------------------------------
+// NVS
+// ---------------------------------------------------------------------
+// Chaves usadas (limite de 15 caracteres por chave):
+//   tot_cycles      u32  - ciclos A/B completos
+//   tot_water_x10   u32  - m3 acumulados * 10
+//   tank1_vol_x100  u32  - volume do tanque 1 * 100
+//   tank2_vol_x100  u32  - volume do tanque 2 * 100
+//   purge_vol_x100  u32  - volume de purga * 100
+//   num_cycles      u32  - ciclos por dia
+//   purge_cyc_min   u32  - minutos de purga do ciclo
+//   auto_en         u8   - modo automatico ligado/desligado
+// ---------------------------------------------------------------------
 static void load_totals_from_nvs(void)
 {
     nvs_handle_t handle = 0;
@@ -676,6 +730,8 @@ static void load_totals_from_nvs(void)
     uint32_t tank1_x100 = 0;
     uint32_t tank2_x100 = 0;
     uint32_t purge_x100 = 0;
+    uint32_t cycles_day = 0;
+    uint32_t purge_min = 0;
     uint8_t  auto_en = 0;
 
     err = nvs_get_u32(handle, "tot_cycles", &cycles);
@@ -686,17 +742,28 @@ static void load_totals_from_nvs(void)
     if (err == ESP_OK) {
         total_water_in_m3 = (double)water_x10 / 10.0;
     }
+    // Os setters abaixo validam a faixa: se a NVS estiver corrompida ou
+    // vier de uma versao antiga com outros limites, o valor e descartado
+    // e o default de compilacao permanece.
     err = nvs_get_u32(handle, "tank1_vol_x100", &tank1_x100);
-    if (err == ESP_OK) {
-        tank1_volume_m3 = (double)tank1_x100 / 100.0;
+    if (err == ESP_OK && !set_tank_volume(1, (double)tank1_x100 / 100.0)) {
+        ESP_LOGW(TAG, "Volume do tanque 1 na NVS fora da faixa, mantendo %.2f m3", tank1_volume_m3);
     }
     err = nvs_get_u32(handle, "tank2_vol_x100", &tank2_x100);
-    if (err == ESP_OK) {
-        tank2_volume_m3 = (double)tank2_x100 / 100.0;
+    if (err == ESP_OK && !set_tank_volume(2, (double)tank2_x100 / 100.0)) {
+        ESP_LOGW(TAG, "Volume do tanque 2 na NVS fora da faixa, mantendo %.2f m3", tank2_volume_m3);
     }
     err = nvs_get_u32(handle, "purge_vol_x100", &purge_x100);
-    if (err == ESP_OK) {
-        purge_volume_m3 = (double)purge_x100 / 100.0;
+    if (err == ESP_OK && !set_purge_volume((double)purge_x100 / 100.0)) {
+        ESP_LOGW(TAG, "Volume de purga na NVS fora da faixa, mantendo %.2f m3", purge_volume_m3);
+    }
+    err = nvs_get_u32(handle, "num_cycles", &cycles_day);
+    if (err == ESP_OK && !set_num_cycles_per_day((int32_t)cycles_day)) {
+        ESP_LOGW(TAG, "Ciclos/dia na NVS fora da faixa, mantendo %d", (int)num_cycles_per_day);
+    }
+    err = nvs_get_u32(handle, "purge_cyc_min", &purge_min);
+    if (err == ESP_OK && !set_purge_cycle_minutes((int32_t)purge_min)) {
+        ESP_LOGW(TAG, "Tempo de purga na NVS fora da faixa, mantendo %d min", (int)purge_cycle_minutes);
     }
     err = nvs_get_u8(handle, "auto_en", &auto_en);
     if (err == ESP_OK) {
@@ -708,9 +775,10 @@ static void load_totals_from_nvs(void)
 
     nvs_close(handle);
     ESP_LOGI(TAG, "NVS carregada: ciclos=%lu, agua=%.1f m3, tanque1=%.2f m3, tanque2=%.2f m3, "
-             "purga=%.2f m3, automatico=%s",
+             "purga=%.2f m3, ciclos/dia=%d, purga ciclo=%d min, automatico=%s",
              (unsigned long)total_cycles, total_water_in_m3, tank1_volume_m3, tank2_volume_m3,
-             purge_volume_m3, auto_enabled ? "estava LIGADO" : "estava desligado");
+             purge_volume_m3, (int)num_cycles_per_day, (int)purge_cycle_minutes,
+             auto_enabled ? "estava LIGADO" : "estava desligado");
 }
 
 static void save_totals_to_nvs(void)
@@ -754,19 +822,26 @@ static void save_auto_enabled_to_nvs(bool en)
     nvs_close(handle);
 }
 
-// Grava os campos de volume configuraveis (tanques + purga) na NVS.
-static void save_volumes_to_nvs(void)
+// Grava todos os parametros ajustaveis pelo app: volumes dos tanques,
+// volume de purga, ciclos/dia e minutos de purga do ciclo. So e chamada
+// quando o usuario muda algo na pagina, entao nao ha desgaste de flash.
+static void save_settings_to_nvs(void)
 {
     nvs_handle_t handle = 0;
     esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Falha ao abrir NVS para gravar volumes: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Falha ao abrir NVS para gravar configuracoes: %s", esp_err_to_name(err));
         return;
     }
     nvs_set_u32(handle, "tank1_vol_x100", (uint32_t)(tank1_volume_m3 * 100.0 + 0.5));
     nvs_set_u32(handle, "tank2_vol_x100", (uint32_t)(tank2_volume_m3 * 100.0 + 0.5));
     nvs_set_u32(handle, "purge_vol_x100", (uint32_t)(purge_volume_m3 * 100.0 + 0.5));
-    nvs_commit(handle);
+    nvs_set_u32(handle, "num_cycles",     (uint32_t)num_cycles_per_day);
+    nvs_set_u32(handle, "purge_cyc_min",  (uint32_t)purge_cycle_minutes);
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao confirmar gravacao das configuracoes: %s", esp_err_to_name(err));
+    }
     nvs_close(handle);
 }
 
@@ -934,11 +1009,16 @@ static void automation_task(void *arg)
 // ---------------------------------------------------------------------
 #define DNS_PORT 53
 #define DNS_MAX_LEN 512
+// Tamanho do registro de resposta que anexamos: ponteiro de nome (2) +
+// TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) + IPv4 (4) = 16 bytes.
+#define DNS_ANSWER_LEN 16
 
 static void dns_server_task(void *arg)
 {
-    char rx_buffer[DNS_MAX_LEN];
-    uint8_t response[DNS_MAX_LEN];
+    uint8_t rx_buffer[DNS_MAX_LEN];
+    // Com folga para o registro anexado: mesmo uma pergunta do tamanho
+    // maximo cabe aqui depois da resposta ser montada.
+    uint8_t response[DNS_MAX_LEN + DNS_ANSWER_LEN];
 
     struct sockaddr_in dest_addr = {
         .sin_family = AF_INET,
@@ -964,24 +1044,52 @@ static void dns_server_task(void *arg)
     while (1) {
         struct sockaddr_in source_addr;
         socklen_t socklen = sizeof(source_addr);
-        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer), 0,
                             (struct sockaddr *)&source_addr, &socklen);
-        if (len < 12) continue; // menor que um cabecalho DNS valido
 
-        int resp_len = len;
-        memcpy(response, rx_buffer, len);
+        // --- Validacoes de entrada (pacote nao confiavel) ---
+        if (len < 12 || len > DNS_MAX_LEN) continue;  // cabecalho DNS minimo / tamanho maximo
+        if (rx_buffer[2] & 0x80) continue;            // ja e uma resposta, ignora
+        if ((rx_buffer[2] >> 3) & 0x0F) continue;     // opcode != query padrao
+        if (rx_buffer[4] != 0 || rx_buffer[5] != 1) continue;  // QDCOUNT precisa ser exatamente 1
 
-        response[2] = 0x81; // resposta, sem truncamento
-        response[3] = 0x80; // recursao disponivel
-        response[6] = 0x00; // ANCOUNT high byte
-        response[7] = 0x01; // ANCOUNT = 1 resposta
+        // Percorre o QNAME para achar o fim da secao de pergunta. Cortar o
+        // pacote aqui descarta qualquer registro adicional (EDNS/OPT) que o
+        // cliente tenha mandado - senao o registro de resposta ficaria
+        // depois do OPT e o celular descartaria o pacote como malformado.
+        int qend = 12;
+        bool name_ok = false;
+        while (qend < len) {
+            uint8_t label_len = rx_buffer[qend];
+            if (label_len == 0) {          // fim do nome
+                qend += 1;
+                name_ok = true;
+                break;
+            }
+            if (label_len & 0xC0) break;   // ponteiro de compressao: invalido na pergunta
+            qend += label_len + 1;
+        }
+        if (!name_ok || qend + 4 > len) continue;  // QNAME truncado ou sem QTYPE/QCLASS
+        qend += 4;                                 // inclui QTYPE (2) + QCLASS (2)
+
+        // --- Monta a resposta: cabecalho + pergunta + 1 registro A ---
+        int resp_len = qend;                       // no maximo DNS_MAX_LEN
+        memcpy(response, rx_buffer, qend);
+
+        response[2] = 0x81;  // QR=1 (resposta), opcode=0, sem truncamento, RD preservado
+        response[3] = 0x80;  // recursao disponivel, RCODE=0
+        response[6] = 0x00; response[7] = 0x01;  // ANCOUNT = 1
+        response[8] = 0x00; response[9] = 0x00;  // NSCOUNT = 0
+        response[10] = 0x00; response[11] = 0x00; // ARCOUNT = 0
 
         response[resp_len++] = 0xC0; response[resp_len++] = 0x0C; // ponteiro pro nome perguntado
         response[resp_len++] = 0x00; response[resp_len++] = 0x01; // TYPE A
         response[resp_len++] = 0x00; response[resp_len++] = 0x01; // CLASS IN
-        response[resp_len++] = 0x00; response[resp_len++] = 0x00; response[resp_len++] = 0x00; response[resp_len++] = 0x3C; // TTL 60s
+        response[resp_len++] = 0x00; response[resp_len++] = 0x00;
+        response[resp_len++] = 0x00; response[resp_len++] = 0x3C; // TTL 60s
         response[resp_len++] = 0x00; response[resp_len++] = 0x04; // RDLENGTH = 4 bytes
-        response[resp_len++] = 192;  response[resp_len++] = 168;  response[resp_len++] = 4; response[resp_len++] = 1; // 192.168.4.1
+        response[resp_len++] = 192;  response[resp_len++] = 168;
+        response[resp_len++] = 4;    response[resp_len++] = 1;    // 192.168.4.1
 
         sendto(sock, response, resp_len, 0, (struct sockaddr *)&source_addr, socklen);
     }
@@ -1397,6 +1505,7 @@ static esp_err_t config_cycles_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, "numero de ciclos invalido (faixa permitida: 1 a 28)",
                                 HTTPD_RESP_USE_STRLEN);
     }
+    save_settings_to_nvs();
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1419,6 +1528,7 @@ static esp_err_t config_purge_cycle_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, "tempo de purga invalido (faixa permitida: 1 a 60 min)",
                                 HTTPD_RESP_USE_STRLEN);
     }
+    save_settings_to_nvs();
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1445,7 +1555,7 @@ static esp_err_t config_tank_volume_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, "parametros invalidos (tank=1 ou 2, m3 entre 0.1 e 10.0)",
                                 HTTPD_RESP_USE_STRLEN);
     }
-    save_volumes_to_nvs();
+    save_settings_to_nvs();
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1468,7 +1578,7 @@ static esp_err_t config_purge_volume_get_handler(httpd_req_t *req)
         return httpd_resp_send(req, "volume de purga invalido (entre 0.0 e 5.0 m3)",
                                 HTTPD_RESP_USE_STRLEN);
     }
-    save_volumes_to_nvs();
+    save_settings_to_nvs();
 
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
@@ -1549,6 +1659,12 @@ static httpd_handle_t start_webserver(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 28;
     config.uri_match_fn = httpd_uri_match_wildcard;
+    // Celular que sai do alcance (ou trava a tela) deixa sockets abertos.
+    // Sem isso, o httpd esgota os slots e passa a recusar conexoes novas:
+    // a pagina para de responder ("sem conexao com o ESP32") enquanto a
+    // automacao continua rodando normalmente. Com lru_purge_enable o
+    // servidor derruba a conexao mais antiga para atender a nova.
+    config.lru_purge_enable = true;
 
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t root_uri       = { .uri = "/",              .method = HTTP_GET, .handler = root_get_handler };
