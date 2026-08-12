@@ -327,8 +327,8 @@ typedef enum {
 static volatile bool auto_enabled = false;
 static volatile bool stop_requested = false;
 static volatile bool skip_requested = false;
-static volatile int32_t num_cycles_per_day = 9; // configuravel pelo app
-static volatile int32_t purge_cycle_minutes = 5;  // purga do Ciclo A/B, configuravel
+static volatile int32_t num_cycles_per_day = 10; // configuravel pelo app
+static volatile int32_t purge_cycle_minutes = 1;  // purga do Ciclo A/B, configuravel
 static volatile uint32_t total_cycles = 0;        // ciclos A/B completos desde o boot
 static volatile double total_water_in_m3 = 0.0;   // agua estimada que entrou (poco -> tanque)
 static auto_state_t auto_state = AUTO_OFF;
