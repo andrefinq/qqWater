@@ -43,6 +43,26 @@
  *   - Numero de ciclos/dia e tempo de purga do ciclo (ajustaveis pelo
  *     app). Sao lidos de volta no boot com validacao de faixa, para que
  *     uma queda de energia nao devolva a automacao aos valores default.
+ *   - Estado de espera + tempo restante (ver RETOMADA APOS QUEDA abaixo).
+ *
+ * RETOMADA APOS QUEDA DE ENERGIA:
+ *   Os estados de espera (as decantacoes de 50 min e as esperas de janela
+ *   de ciclo) sao os que mais custam tempo, e sao justamente os estados em
+ *   que NENHUM rele esta acionado. Por isso eles gravam na NVS, a cada
+ *   minuto, o proprio estado e quanto tempo ainda falta. No boot, se o
+ *   Modo Automatico estava ligado e as boias confirmam os tanques cheios,
+ *   a automacao volta exatamente para aquele estado com o tempo que
+ *   faltava - sem repetir a decantacao inteira.
+ *
+ *   O ESP32 nao tem RTC com bateria, entao o tempo de apagao em si nao e
+ *   contabilizado: o relogio da decantacao apenas congela e volta de onde
+ *   parou. Isso e conservador (decanta-se de mais, nunca de menos), ja que
+ *   a decantacao fisica continua acontecendo com a energia cortada.
+ *
+ *   Os estados ATIVOS (enchendo, purgando, esvaziando) NAO sao retomados.
+ *   Voltar sozinho a energizar bomba e valvula depois de um reinicio
+ *   inesperado e uma decisao que exige operador; nesses casos o boot faz
+ *   um Start normal, como antes.
  *
  * ESTIMATIVAS DE AGUA:
  *   - "agua consumida/dia" = ciclos/dia * media dos volumes dos tanques.
@@ -390,6 +410,15 @@ static int64_t b2_start_deadline_us = 0;
 static int64_t watchdog_deadline_us = 0;
 static int64_t watchdog_total_ms = 0;
 
+// Gravacao periodica do progresso dos estados de espera na NVS, para
+// permitir retomar de onde parou apos uma queda de energia. Um minuto de
+// resolucao e suficiente (erro maximo de 1 min numa espera de 50 a 95 min)
+// e mantem o desgaste da flash desprezivel: como a NVS ignora escritas com
+// valor identico, so o campo "faltam X segundos" e realmente regravado,
+// uma vez por minuto e apenas durante as esperas.
+#define STATE_SAVE_PERIOD_US (60LL * 1000 * 1000)
+static int64_t last_state_save_us = 0;
+
 static inline int64_t elapsed_ms(void)
 {
     return (esp_timer_get_time() - state_enter_time_us) / 1000;
@@ -425,6 +454,8 @@ static inline bool watchdog_expired(void)
 // onde o watchdog expirar e o comportamento normal, nao uma falha.
 static void trigger_fault(const char *msg); // definida mais abaixo
 static void set_auto_enabled(bool en);      // definida mais abaixo (grava na NVS)
+static void persist_auto_state(void);       // grava estado + tempo restante na NVS
+static void clear_persisted_auto_state(void); // marca "nada a retomar" na NVS
 static void check_watchdog_fault(void)
 {
     if (watchdog_expired()) {
@@ -439,6 +470,26 @@ static void schedule_b2_start(void)
     b2_start_pending = true;
     b2_start_deadline_us = esp_timer_get_time() + B2_START_DELAY_MS * 1000;
     ESP_LOGI(TAG, "Atraso de %d s agendado para ligar B2", (int)(B2_START_DELAY_MS / 1000));
+}
+
+// Estados que podem ser retomados depois de um reinicio. Todos eles tem
+// duas propriedades essenciais: nenhum rele acionado (entao o boot com
+// tudo desligado ja e o estado correto do hardware) e o unico "progresso"
+// e a passagem do tempo, que da para gravar. Os estados ativos ficam de
+// fora de proposito - ver a nota RETOMADA APOS QUEDA no topo do arquivo.
+static bool state_is_resumable(auto_state_t s)
+{
+    switch (s) {
+        case ST_START_DECANT:
+        case A_DECANT:
+        case B_DECANT:
+        case ST_START_WAIT:
+        case A_WAIT:
+        case B_WAIT:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static void enter_state(auto_state_t new_state)
@@ -537,6 +588,17 @@ static void enter_state(auto_state_t new_state)
             enter_state(AUTO_OFF);
             return;
     }
+
+    // Marca na NVS se este estado pode ou nao ser retomado apos um
+    // reinicio. Limpar nos estados ativos e o que impede o boot de
+    // ressuscitar uma decantacao velha depois de uma queda durante,
+    // por exemplo, a purga.
+    if (state_is_resumable(new_state)) {
+        persist_auto_state();
+    } else {
+        clear_persisted_auto_state();
+    }
+
     ESP_LOGI(TAG, "Automacao -> estado %d", (int)new_state);
 }
 
@@ -577,6 +639,8 @@ static void trigger_fault(const char *msg)
     stop_requested = false;
     auto_state = AUTO_OFF;
     state_enter_time_us = esp_timer_get_time();
+    // Falha nao pode ser retomada sozinha no proximo boot.
+    clear_persisted_auto_state();
 }
 
 // So chamar durante estados em que a Bomba 1 esta enchendo um tanque
@@ -845,6 +909,133 @@ static void save_settings_to_nvs(void)
     nvs_close(handle);
 }
 
+// ---------------------------------------------------------------------
+// Persistencia do estado de espera (retomada apos queda de energia)
+// ---------------------------------------------------------------------
+// Chaves adicionais:
+//   st_state     u8   - estado da automacao (AUTO_STATE_NVS_NONE = nada a retomar)
+//   st_remain_s  u32  - segundos que ainda faltam naquele estado
+//   st_total_s   u32  - duracao total do estado (usada pelo timer do app)
+#define AUTO_STATE_NVS_NONE 0xFF
+
+static void persist_auto_state(void)
+{
+    last_state_save_us = esp_timer_get_time();
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao abrir NVS para gravar o estado: %s", esp_err_to_name(err));
+        return;
+    }
+    nvs_set_u8(handle, "st_state", (uint8_t)auto_state);
+    nvs_set_u32(handle, "st_remain_s", (uint32_t)(state_remaining_ms() / 1000));
+    nvs_set_u32(handle, "st_total_s", (uint32_t)(state_total_ms() / 1000));
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static void clear_persisted_auto_state(void)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open("qqwater", NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Falha ao abrir NVS para limpar o estado: %s", esp_err_to_name(err));
+        return;
+    }
+    nvs_set_u8(handle, "st_state", AUTO_STATE_NVS_NONE);
+    nvs_commit(handle);
+    nvs_close(handle);
+}
+
+// Chamada uma unica vez, no inicio da automation_task. Retorna true se
+// conseguiu retomar o estado salvo (e nesse caso NAO chama enter_state -
+// os reles ja estao todos desligados pelo boot, que e exatamente o
+// hardware correto para os estados de espera).
+static bool restore_auto_state_from_nvs(void)
+{
+    if (!auto_enabled) {
+        return false;   // automatico estava desligado: nada a retomar
+    }
+
+    nvs_handle_t handle = 0;
+    if (nvs_open("qqwater", NVS_READONLY, &handle) != ESP_OK) {
+        return false;
+    }
+
+    uint8_t  state_id = AUTO_STATE_NVS_NONE;
+    uint32_t remain_s = 0;
+    uint32_t total_s  = 0;
+    bool have_state = (nvs_get_u8(handle, "st_state", &state_id) == ESP_OK);
+    if (have_state) {
+        nvs_get_u32(handle, "st_remain_s", &remain_s);
+        nvs_get_u32(handle, "st_total_s", &total_s);
+    }
+    nvs_close(handle);
+
+    if (!have_state || state_id == AUTO_STATE_NVS_NONE) {
+        return false;
+    }
+
+    auto_state_t s = (auto_state_t)state_id;
+    if (!state_is_resumable(s)) {
+        return false;   // NVS de versao antiga ou valor inesperado
+    }
+
+    // Conferencia contra as boias: o estado salvo pressupoe tanque cheio.
+    // Se a energia ficou fora tempo suficiente para alguem esvaziar (ou se
+    // houve manutencao), a premissa nao vale mais e e mais seguro comecar
+    // do zero do que purgar/drenar um tanque que nao esta onde se pensa.
+    bool tanks_ok;
+    switch (s) {
+        case ST_START_DECANT:
+        case A_DECANT:
+            tanks_ok = tank_high(1);
+            break;
+        case B_DECANT:
+            tanks_ok = tank_high(2);
+            break;
+        default:    // ST_START_WAIT, A_WAIT, B_WAIT: os dois tanques cheios
+            tanks_ok = tank_high(1) && tank_high(2);
+            break;
+    }
+    if (!tanks_ok) {
+        ESP_LOGW(TAG, "Estado %d salvo na NVS, mas as boias nao confirmam tanque cheio - "
+                      "iniciando um Start normal", (int)s);
+        return false;
+    }
+
+    int64_t now = esp_timer_get_time();
+    int64_t remain_ms = (int64_t)remain_s * 1000;
+
+    switch (s) {
+        case ST_START_DECANT:
+        case A_DECANT:
+        case B_DECANT:
+            // Decantacao tem duracao fixa: recoloca o relogio de entrada no
+            // estado de modo que "falta remain_ms" continue valendo.
+            if (remain_ms > DECANT_MS) remain_ms = DECANT_MS;
+            state_enter_time_us = now - (DECANT_MS - remain_ms) * 1000;
+            break;
+        default:
+            // Esperas de janela de ciclo sao regidas pelo watchdog, entao o
+            // que se restaura e o prazo, nao o instante de entrada.
+            watchdog_total_ms = (int64_t)total_s * 1000;
+            if (watchdog_total_ms <= 0) watchdog_total_ms = get_cycle_watchdog_ms();
+            if (remain_ms > watchdog_total_ms) remain_ms = watchdog_total_ms;
+            watchdog_deadline_us = now + remain_ms * 1000;
+            state_enter_time_us = now;
+            break;
+    }
+
+    auto_state = s;
+    fault_msg[0] = '\0';
+    last_state_save_us = now;
+    ESP_LOGW(TAG, "Retomando o estado %d apos reinicio - faltam %d min de espera",
+             (int)s, (int)(remain_ms / 60000));
+    return true;
+}
+
 // Usado no toggle manual e sempre que o sistema muda auto_enabled sozinho
 // (fim de sequencia de parada, falha). Mantem a flag persistida em dia.
 static void set_auto_enabled(bool en)
@@ -865,8 +1056,24 @@ static void automation_task(void *arg)
 {
     static bool prev_auto_enabled = false;
 
+    // Espera as boias passarem pelo debounce antes de decidir se da para
+    // retomar o estado salvo - a conferencia de tanque cheio depende delas.
+    vTaskDelay(pdMS_TO_TICKS(BOIA_POLL_PERIOD_MS * (BOIA_DEBOUNCE_THRESHOLD + 3)));
+    if (restore_auto_state_from_nvs()) {
+        // Impede que o loop abaixo interprete auto_enabled=true como
+        // "acabou de ligar o toggle" e dispare um Start por cima.
+        prev_auto_enabled = true;
+    }
+
     while (1) {
         check_overpressure();
+
+        // Salva o progresso das esperas de tempos em tempos, para o proximo
+        // boot saber de onde continuar.
+        if (state_is_resumable(auto_state) &&
+            (esp_timer_get_time() - last_state_save_us) >= STATE_SAVE_PERIOD_US) {
+            persist_auto_state();
+        }
 
         // Atraso centralizado de ligar a B2 (agendado em schedule_b2_start()).
         // Um unico ponto de checagem, nao-bloqueante, independente do estado atual.
@@ -1774,5 +1981,6 @@ void app_main(void)
     xTaskCreate(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL);
     start_webserver();
 
-    ESP_LOGI(TAG, "qqWater pronto. Conecte na rede '%s' e acesse http://192.168.4.1", AP_SSID);
+    ESP_LOGI(TAG, "qqWater pronto... Conecte na rede '%s' e acesse http://192.168.4.1", AP_SSID);
+
 }
