@@ -67,6 +67,21 @@
  * ESTIMATIVAS DE AGUA:
  *   - "agua consumida/dia" = ciclos/dia * media dos volumes dos tanques.
  *   - "agua produzida/dia" = consumida - (ciclos/dia * volume de purga).
+ *
+ * ESTABILIDADE DO WI-FI / SERVIDOR WEB:
+ *   Sintoma observado em campo: depois de muito tempo ligado, o celular
+ *   conecta no AP mas a pagina responde "empty response"/"socket error";
+ *   a automacao segue normal e so um reinicio resolve. Medidas:
+ *   - pilha da task httpd 4 KB -> 8 KB (o handler de status sozinho usa
+ *     2 KB de buffer + printf de float, e e chamado a cada 2 s);
+ *   - TCP keep-alive nas sessoes HTTP, para derrubar conexoes de
+ *     celulares que sairam do alcance/dormiram sem fechar o socket;
+ *   - CONFIG_LWIP_MAX_SOCKETS 10 -> 16 no sdkconfig (antes sobrava zero:
+ *     7 sessoes + escuta + controle do httpd + DNS = 10);
+ *   - DNS do captive portal responde consultas nao-A (ex.: AAAA) sem
+ *     registro, em vez de devolver um registro A para elas;
+ *   - task de diagnostico que loga heap, sobra de pilha do httpd e
+ *     numero de clientes a cada minuto, mais eventos de conexao/DHCP.
  */
 
 #include <string.h>
@@ -82,6 +97,8 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "esp_rom_sys.h"
@@ -1277,17 +1294,32 @@ static void dns_server_task(void *arg)
             qend += label_len + 1;
         }
         if (!name_ok || qend + 4 > len) continue;  // QNAME truncado ou sem QTYPE/QCLASS
+        uint16_t qtype  = ((uint16_t)rx_buffer[qend]     << 8) | rx_buffer[qend + 1];
+        uint16_t qclass = ((uint16_t)rx_buffer[qend + 2] << 8) | rx_buffer[qend + 3];
         qend += 4;                                 // inclui QTYPE (2) + QCLASS (2)
 
-        // --- Monta a resposta: cabecalho + pergunta + 1 registro A ---
+        // So respondemos com endereco consultas do tipo A (IPv4), classe IN.
+        // Para qualquer outra (AAAA, HTTPS/SVCB, etc.) devolvemos NOERROR sem
+        // registro ("esse nome existe, mas nao tem esse tipo"). Antes o
+        // servidor mandava um registro A como resposta a uma pergunta AAAA, o
+        // que e invalido e pode fazer o resolvedor do Android (Samsung em
+        // particular) descartar a resposta e nao detectar o portal.
+        bool answer_a = (qtype == 1 && qclass == 1);
+
+        // --- Monta a resposta: cabecalho + pergunta (+ 1 registro A) ---
         int resp_len = qend;                       // no maximo DNS_MAX_LEN
         memcpy(response, rx_buffer, qend);
 
         response[2] = 0x81;  // QR=1 (resposta), opcode=0, sem truncamento, RD preservado
         response[3] = 0x80;  // recursao disponivel, RCODE=0
-        response[6] = 0x00; response[7] = 0x01;  // ANCOUNT = 1
+        response[6] = 0x00; response[7] = answer_a ? 0x01 : 0x00;  // ANCOUNT
         response[8] = 0x00; response[9] = 0x00;  // NSCOUNT = 0
         response[10] = 0x00; response[11] = 0x00; // ARCOUNT = 0
+
+        if (!answer_a) {
+            sendto(sock, response, resp_len, 0, (struct sockaddr *)&source_addr, socklen);
+            continue;
+        }
 
         response[resp_len++] = 0xC0; response[resp_len++] = 0x0C; // ponteiro pro nome perguntado
         response[resp_len++] = 0x00; response[resp_len++] = 0x01; // TYPE A
@@ -1564,6 +1596,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
 }
 
+// Menor sobra de pilha (bytes) ja vista na task do httpd. Medida dentro do
+// handler de status por ser o mais pesado e o mais chamado (a cada 2 s).
+// Logada pela task de diagnostico; perto de zero = risco de estouro.
+static volatile uint32_t httpd_stack_min_free = UINT32_MAX;
+
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
     char buf[2048];
@@ -1623,7 +1660,13 @@ static esp_err_t status_get_handler(httpd_req_t *req)
                      total_water_in_m3);
 
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, buf, len);
+    esp_err_t ret = httpd_resp_send(req, buf, len);
+
+    uint32_t free_stack = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+    if (free_stack < httpd_stack_min_free) {
+        httpd_stack_min_free = free_stack;
+    }
+    return ret;
 }
 
 static esp_err_t relay_get_handler(httpd_req_t *req)
@@ -1873,6 +1916,27 @@ static httpd_handle_t start_webserver(void)
     // servidor derruba a conexao mais antiga para atender a nova.
     config.lru_purge_enable = true;
 
+    // O padrao (4 KB) fica no limite: so o status_get_handler usa 2 KB de
+    // buffer local, mais o snprintf com varios %f. Um estouro que nao pega
+    // o canario corrompe memoria em silencio e deixa o servidor "zumbi"
+    // enquanto o resto do firmware segue normal.
+    config.stack_size = 8192;
+
+    // Explicito para deixar clara a conta de sockets: 7 sessoes + 3
+    // internos do httpd, de CONFIG_LWIP_MAX_SOCKETS=16 (sobram 6, um deles
+    // usado pelo DNS).
+    config.max_open_sockets = 7;
+    config.recv_wait_timeout = 5;
+    config.send_wait_timeout = 5;
+
+    // TCP keep-alive: celular que dorme ou sai do alcance sem fechar a
+    // conexao e detectado em ~30 + 3*5 = 45 s e a sessao e liberada, em
+    // vez de ocupar o slot ate o LRU purge precisar dele.
+    config.keep_alive_enable = true;
+    config.keep_alive_idle = 30;
+    config.keep_alive_interval = 5;
+    config.keep_alive_count = 3;
+
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t root_uri       = { .uri = "/",              .method = HTTP_GET, .handler = root_get_handler };
         httpd_uri_t status_uri     = { .uri = "/api/status",     .method = HTTP_GET, .handler = status_get_handler };
@@ -1927,6 +1991,52 @@ static httpd_handle_t start_webserver(void)
 }
 
 // ---------------------------------------------------------------------
+// Diagnostico de rede
+// ---------------------------------------------------------------------
+// Loga entrada/saida de celulares no AP e o IP entregue pelo DHCP. Se um
+// Samsung "conecta" mas nunca aparece a linha de IP atribuido, o problema
+// e DHCP; se recebe IP e mesmo assim a pagina nao abre, e no HTTP/TCP.
+static void wifi_diag_event_handler(void *arg, esp_event_base_t base,
+                                    int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *e = (wifi_event_ap_staconnected_t *)data;
+        ESP_LOGI(TAG, "[diag] cliente conectou: " MACSTR " (aid=%d)", MAC2STR(e->mac), e->aid);
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *e = (wifi_event_ap_stadisconnected_t *)data;
+        ESP_LOGI(TAG, "[diag] cliente desconectou: " MACSTR " (motivo=%d)", MAC2STR(e->mac), e->reason);
+    } else if (base == IP_EVENT && id == IP_EVENT_ASSIGNED_IP_TO_CLIENT) {
+        ip_event_assigned_ip_to_client_t *e = (ip_event_assigned_ip_to_client_t *)data;
+        ESP_LOGI(TAG, "[diag] DHCP entregou " IPSTR " para " MACSTR, IP2STR(&e->ip), MAC2STR(e->mac));
+    }
+}
+
+#define DIAG_PERIOD_MS (60 * 1000)
+
+// Uma linha por minuto no monitor serial. Leitura rapida quando a pagina
+// parar de abrir:
+//   heap_min caindo sem parar ......... vazamento de memoria
+//   httpd_pilha_min perto de 0 ........ estouro de pilha do servidor web
+//   clientes = 0 com celular "conectado" ... problema no lado do Wi-Fi
+static void diag_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(DIAG_PERIOD_MS));
+
+        wifi_sta_list_t sta_list = {0};
+        int n_sta = (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) ? sta_list.num : -1;
+
+        uint32_t stack_min = httpd_stack_min_free;
+        ESP_LOGI(TAG, "[diag] uptime=%lld min heap=%lu heap_min=%lu httpd_pilha_min=%ld clientes=%d",
+                 (long long)(esp_timer_get_time() / 60000000LL),
+                 (unsigned long)esp_get_free_heap_size(),
+                 (unsigned long)esp_get_minimum_free_heap_size(),
+                 (stack_min == UINT32_MAX) ? -1L : (long)stack_min,
+                 n_sta);
+    }
+}
+
+// ---------------------------------------------------------------------
 // Wi-Fi Access Point
 // ---------------------------------------------------------------------
 static void wifi_init_softap(void)
@@ -1934,6 +2044,13 @@ static void wifi_init_softap(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_ap();
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
+                                               wifi_diag_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
+                                               wifi_diag_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ASSIGNED_IP_TO_CLIENT,
+                                               wifi_diag_event_handler, NULL));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1980,6 +2097,7 @@ void app_main(void)
     wifi_init_softap();
     xTaskCreate(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL);
     start_webserver();
+    xTaskCreate(diag_task, "diag_task", 3072, NULL, 3, NULL);
 
     ESP_LOGI(TAG, "qqWater pronto... Conecte na rede '%s' e acesse http://192.168.4.1", AP_SSID);
 
