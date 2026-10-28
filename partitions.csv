@@ -1,0 +1,17 @@
+# Tabela de particoes do qqWater (flash de 4 MB, com OTA).
+#
+# A NVS fica EXATAMENTE onde estava na tabela "single app" usada antes
+# (0x9000, 0x6000 bytes). Assim, ao migrar para esta tabela pelo cabo USB,
+# os dados gravados (totalizadores, credenciais Wi-Fi, configuracoes,
+# estado da decantacao) sao preservados. NAO mude offset/tamanho da NVS.
+#
+# ota_0 / ota_1: duas copias do firmware (a que roda e a que recebe a
+# atualizacao). otadata: diz ao bootloader qual delas iniciar.
+#
+# Name,   Type, SubType, Offset,   Size
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x1E0000,
+ota_1,    app,  ota_1,   0x200000, 0x1E0000,
+# 0x3E0000 - 0x400000 (128 KB) livre para uso futuro
