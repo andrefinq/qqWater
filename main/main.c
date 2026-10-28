@@ -7,6 +7,8 @@
  *   ao conectar (igual wifi de aeroporto)
  * - Login (usuario/senha) antes de acessar a pagina e a API
  * - Dois sensores de fluxo (poco e agua tratada): vazao e totalizador
+ * - Atualizacao de firmware pela pagina (OTA), com volta automatica para a
+ *   versao anterior se a nova falhar - ver README.md e partitions.csv
  * - Servidor web com 8 boteos manuais (bloqueados durante automacao)
  * - Toggle "Modo Automatico" + botao "Parar Sistema"
  * - Modulo de rele optoacoplado, ativo em HIGH
@@ -101,6 +103,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <ctype.h>
+#include <sys/param.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -112,6 +115,9 @@
 #include "esp_system.h"
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_app_format.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
 #include "esp_rom_sys.h"
@@ -2103,6 +2109,9 @@ static const char index_html[] =
 ".wst{font-size:13px;line-height:1.5;}"
 ".wst b{color:#e8eef5;}"
 ".msg{font-size:12px;min-height:16px;margin-top:8px;color:#8ea0b3;}"
+".bar{height:8px;border-radius:4px;background:#26313f;overflow:hidden;margin-top:10px;}"
+".bar div{height:100%;width:0;background:#1f9d55;transition:width .2s;}"
+".form input[type=file]{padding:8px;font-size:12px;}"
 "</style></head><body>"
 "<div class='topbar'><a href='/logout'>Sair</a></div>"
 "<h1>Controle do Poco - qqWater</h1>"
@@ -2165,6 +2174,17 @@ static const char index_html[] =
 "<button class='btn-ok' onclick='wifiSave()'>Salvar e conectar</button>"
 "<button class='btn-warn' onclick='wifiForget()'>Esquecer rede (somente AP)</button>"
 "<div class='msg' id='wifiMsg'></div>"
+"</div></details>"
+"</div>"
+"<h2><span>Firmware</span></h2>"
+"<div class='box'>"
+"<div class='wst' id='otaInfo'>carregando...</div>"
+"<details id='otaDet'><summary>Atualizar firmware</summary>"
+"<div class='form'>"
+"<label for='otaFile'>Arquivo build/qqWater.bin</label><input id='otaFile' type='file' accept='.bin'>"
+"<button class='btn-ok' id='otaBtn' onclick='otaUpload()'>Enviar e atualizar</button>"
+"<div class='bar'><div id='otaBar'></div></div>"
+"<div class='msg' id='otaMsg'></div>"
 "</div></details>"
 "</div>"
 "<div class='status' id='status'>conectando...</div>"
@@ -2379,8 +2399,48 @@ static const char index_html[] =
 "  wifiMsg.textContent='Rede esquecida.';"
 "  setTimeout(wifiRefresh,1500);"
 "}"
+"const otaInfo=document.getElementById('otaInfo');"
+"const otaMsg=document.getElementById('otaMsg');"
+"const otaBar=document.getElementById('otaBar');"
+"let otaWaitVersion='';"
+"async function otaRefresh(){"
+"  try{"
+"    const d=await (await api('/api/ota/info')).json();"
+"    otaInfo.textContent='';"
+"    const add=(k,v)=>{ const l=document.createElement('div'); l.textContent=k; if(v!==undefined){ const b=document.createElement('b'); b.textContent=v; l.appendChild(b);} otaInfo.appendChild(l); };"
+"    add('Versao: ',d.version);"
+"    add('Compilado em: ',d.date+' '+d.time);"
+"    add('Particao: ',d.partition);"
+"    if(d.pending_verify) add('Em teste - confirma apos 1 min rodando normal');"
+"    if(d.reboot_pending) add('Firmware '+d.new_version+' gravado - ',d.safe?'reiniciando...':'reinicia quando a automacao entrar em espera');"
+"    if(otaWaitVersion && d.version===otaWaitVersion){ otaMsg.textContent='Atualizado para '+d.version+'.'; otaWaitVersion=''; otaBar.style.width='0'; }"
+"  }catch(e){ if(otaWaitVersion) otaInfo.textContent='Reiniciando... aguarde'; }"
+"}"
+"function otaUpload(){"
+"  const f=document.getElementById('otaFile').files[0];"
+"  if(!f){ otaMsg.textContent='Escolha o arquivo .bin'; return; }"
+"  if(!confirm('Enviar '+f.name+' ('+Math.round(f.size/1024)+' KB) e atualizar o firmware?')) return;"
+"  const btn=document.getElementById('otaBtn'); btn.disabled=true;"
+"  const x=new XMLHttpRequest();"
+"  x.open('POST','/api/ota');"
+"  x.setRequestHeader('Content-Type','application/octet-stream');"
+"  x.upload.onprogress=e=>{ if(e.lengthComputable){ const p=Math.round(e.loaded*100/e.total); otaBar.style.width=p+'%'; otaMsg.textContent='Enviando e gravando... '+p+'%'; } };"
+"  x.onload=()=>{"
+"    btn.disabled=false;"
+"    if(x.status===401){ location.href='/login'; return; }"
+"    if(x.status!==200){ otaMsg.textContent='Erro: '+x.responseText; otaBar.style.width='0'; return; }"
+"    const r=JSON.parse(x.responseText);"
+"    otaWaitVersion=r.version;"
+"    otaMsg.textContent=r.reboot_now?'Firmware '+r.version+' gravado. Reiniciando...':'Firmware '+r.version+' gravado. O ESP reinicia sozinho quando a automacao entrar em espera.';"
+"    otaRefresh();"
+"  };"
+"  x.onerror=()=>{ btn.disabled=false; otaMsg.textContent='Falha de conexao durante o envio'; };"
+"  x.send(f);"
+"}"
 "refresh();"
 "wifiRefresh();"
+"otaRefresh();"
+"setInterval(otaRefresh,5000);"
 "setInterval(refresh,2000);"
 "setInterval(wifiRefresh,5000);"
 "setInterval(tickTimer,1000);"
@@ -2662,6 +2722,207 @@ static esp_err_t wifi_forget_handler(httpd_req_t *req)
     net_request_forget();
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+// ---- Atualizacao de firmware pela rede (OTA) ---------------------------
+// Fluxo: a pagina envia o arquivo build/qqWater.bin (POST /api/ota). O
+// firmware grava na particao OTA que NAO esta rodando, confere a imagem e a
+// marca para o proximo boot. O reinicio NAO e imediato: so acontece quando
+// a automacao estiver desligada ou num estado de espera (decantacao / janela
+// de ciclo) - os mesmos estados que a retomada apos queda de energia cobre.
+// Assim um upload no meio de um enchimento ou purga nunca interrompe a
+// operacao; ele so "agenda" a troca.
+//
+// Protecao contra firmware ruim (rollback, CONFIG_BOOTLOADER_APP_ROLLBACK):
+// a versao nova sobe em estado "pendente". So depois de OTA_CONFIRM_MS
+// rodando normal ela se confirma. Se travar/reiniciar antes, o bootloader
+// volta sozinho para a versao anterior.
+#define OTA_CONFIRM_MS      (60 * 1000)
+#define OTA_RX_CHUNK        4096
+#define OTA_HDR_LEN         (sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t))
+
+static volatile bool ota_in_progress = false;
+static volatile bool ota_reboot_pending = false;
+static volatile bool ota_pending_verify = false;   // esta versao ainda nao foi confirmada
+static char ota_new_version[33] = "";
+
+static bool ota_safe_to_reboot(void)
+{
+    auto_state_t st = auto_state;
+    return st == AUTO_OFF || state_is_resumable(st);
+}
+
+// Roda em segundo plano: confirma a versao nova depois de estavel e faz o
+// reinicio agendado quando a automacao permitir.
+static void ota_task(void *arg)
+{
+    int64_t boot_us = esp_timer_get_time();
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        if (ota_pending_verify && (esp_timer_get_time() - boot_us) / 1000 >= OTA_CONFIRM_MS) {
+            if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+                ESP_LOGI(TAG, "Firmware %s confirmado (rollback cancelado)", esp_app_get_description()->version);
+            }
+            ota_pending_verify = false;
+        }
+
+        if (ota_reboot_pending && ota_safe_to_reboot()) {
+            ESP_LOGW(TAG, "Reiniciando para o firmware novo %s", ota_new_version);
+            // Garante que o que esta em RAM va para a NVS antes de reiniciar.
+            for (int i = 0; i < NUM_FLOW; i++) {
+                if (flow[i].ok) flow_save_to_nvs(i);
+            }
+            if (state_is_resumable(auto_state)) persist_auto_state();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+        }
+    }
+}
+
+static void ota_init(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ota_pending_verify = true;
+        ESP_LOGW(TAG, "Firmware novo em teste: sera confirmado em %d s se rodar normal",
+                 OTA_CONFIRM_MS / 1000);
+    }
+    ESP_LOGI(TAG, "Firmware %s (%s %s), particao %s",
+             esp_app_get_description()->version, esp_app_get_description()->date,
+             esp_app_get_description()->time, running ? running->label : "?");
+    xTaskCreate(ota_task, "ota_task", 3072, NULL, 3, NULL);
+}
+
+static esp_err_t ota_send_err(httpd_req_t *req, const char *status, const char *msg)
+{
+    ESP_LOGE(TAG, "OTA: %s", msg);
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, msg, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t ota_info_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    const esp_app_desc_t *d = esp_app_get_description();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    char buf[320];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\",\"idf\":\"%s\",\"partition\":\"%s\","
+                     "\"in_progress\":%s,\"reboot_pending\":%s,\"new_version\":\"%s\",\"pending_verify\":%s,"
+                     "\"safe\":%s}",
+                     d->version, d->date, d->time, d->idf_ver, running ? running->label : "?",
+                     ota_in_progress ? "true" : "false", ota_reboot_pending ? "true" : "false",
+                     ota_new_version, ota_pending_verify ? "true" : "false",
+                     ota_safe_to_reboot() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buf, n);
+}
+
+static esp_err_t ota_upload_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    if (ota_in_progress) return ota_send_err(req, "409 Conflict", "Ja existe uma atualizacao em andamento");
+    if (ota_reboot_pending) return ota_send_err(req, "409 Conflict",
+        "Ja ha um firmware novo aguardando reinicio");
+    if (ota_pending_verify) return ota_send_err(req, "409 Conflict",
+        "A versao atual ainda esta em teste (aguarde 1 min apos o boot)");
+
+    const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
+    if (!target) return ota_send_err(req, "500 Internal Server Error",
+        "Sem particao OTA - grave pelo cabo USB a versao com a tabela de particoes nova");
+    if (req->content_len < OTA_HDR_LEN || req->content_len > target->size) {
+        return ota_send_err(req, "400 Bad Request", "Tamanho de arquivo invalido para um firmware");
+    }
+
+    char *chunk = malloc(OTA_RX_CHUNK);
+    if (!chunk) return ota_send_err(req, "500 Internal Server Error", "Sem memoria");
+
+    ota_in_progress = true;
+    esp_ota_handle_t h = 0;
+    bool begun = false;
+    size_t received = 0, hdr_have = 0;
+    uint8_t hdr[OTA_HDR_LEN];
+    const char *fail = NULL;
+    int retries = 0;
+
+    ESP_LOGI(TAG, "OTA: recebendo %u bytes para %s", (unsigned)req->content_len, target->label);
+
+    while (received < req->content_len) {
+        int r = httpd_req_recv(req, chunk, MIN(OTA_RX_CHUNK, req->content_len - received));
+        if (r == HTTPD_SOCK_ERR_TIMEOUT && ++retries < 5) continue;
+        if (r <= 0) { fail = "Conexao interrompida durante o envio"; break; }
+        retries = 0;
+
+        // Cabecalho: confere se o arquivo e mesmo um firmware do qqWater
+        // antes de apagar/gravar qualquer coisa na flash.
+        if (!begun) {
+            size_t take = MIN((size_t)r, OTA_HDR_LEN - hdr_have);
+            memcpy(hdr + hdr_have, chunk, take);
+            hdr_have += take;
+            if (hdr_have < OTA_HDR_LEN) { received += r; continue; }   // cabecalho ainda incompleto
+
+            const esp_image_header_t *ih = (const esp_image_header_t *)hdr;
+            const esp_app_desc_t *nd = (const esp_app_desc_t *)
+                (hdr + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t));
+            if (ih->magic != ESP_IMAGE_HEADER_MAGIC || nd->magic_word != ESP_APP_DESC_MAGIC_WORD) {
+                fail = "Arquivo nao e um firmware ESP32 (use build/qqWater.bin)"; break;
+            }
+            if (ih->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID) {
+                fail = "Firmware compilado para outro chip"; break;
+            }
+            if (strncmp(nd->project_name, esp_app_get_description()->project_name,
+                        sizeof(nd->project_name)) != 0) {
+                fail = "Firmware de outro projeto - esperado qqWater"; break;
+            }
+            strlcpy(ota_new_version, nd->version, sizeof(ota_new_version));
+
+            esp_err_t err = esp_ota_begin(target, OTA_WITH_SEQUENTIAL_WRITES, &h);
+            if (err != ESP_OK) { fail = "Falha ao preparar a particao OTA"; break; }
+            begun = true;
+            // Grava o cabecalho acumulado (pode ter vindo em pedacos) e o
+            // restante deste bloco.
+            if (esp_ota_write(h, hdr, OTA_HDR_LEN) != ESP_OK) { fail = "Falha ao gravar"; break; }
+            size_t rest = (size_t)r - take;
+            if (rest && esp_ota_write(h, chunk + take, rest) != ESP_OK) { fail = "Falha ao gravar"; break; }
+            received += r;
+            continue;
+        }
+        if (esp_ota_write(h, chunk, r) != ESP_OK) { fail = "Falha ao gravar na flash"; break; }
+        received += r;
+    }
+    free(chunk);
+
+    if (!fail && !begun) fail = "Arquivo incompleto";
+    if (!fail) {
+        esp_err_t err = esp_ota_end(h);   // confere checksum/hash da imagem inteira
+        h = 0;
+        if (err == ESP_ERR_OTA_VALIDATE_FAILED) fail = "Imagem corrompida (falhou a verificacao)";
+        else if (err != ESP_OK) fail = "Falha ao finalizar a gravacao";
+    }
+    if (!fail && esp_ota_set_boot_partition(target) != ESP_OK) {
+        fail = "Falha ao selecionar a particao de boot";
+    }
+    if (fail) {
+        if (begun && h) esp_ota_abort(h);
+        ota_new_version[0] = '\0';
+        ota_in_progress = false;
+        return ota_send_err(req, "400 Bad Request", fail);
+    }
+
+    ota_in_progress = false;
+    ota_reboot_pending = true;
+    ESP_LOGW(TAG, "OTA: firmware %s gravado em %s; reinicio %s", ota_new_version, target->label,
+             ota_safe_to_reboot() ? "em instantes" : "quando a automacao entrar em espera");
+
+    char resp[160];
+    int n = snprintf(resp, sizeof(resp), "{\"ok\":true,\"version\":\"%s\",\"reboot_now\":%s}",
+                     ota_new_version, ota_safe_to_reboot() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, n);
 }
 
 // ---- Sensores de fluxo --------------------------------------------------
@@ -3117,6 +3378,10 @@ static httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &wifi_save_uri);
         httpd_register_uri_handler(server, &wifi_forget_uri);
         httpd_register_uri_handler(server, &flow_cfg_uri);
+        httpd_uri_t ota_info_uri    = { .uri = "/api/ota/info",     .method = HTTP_GET,  .handler = ota_info_handler };
+        httpd_uri_t ota_upload_uri  = { .uri = "/api/ota",          .method = HTTP_POST, .handler = ota_upload_handler };
+        httpd_register_uri_handler(server, &ota_info_uri);
+        httpd_register_uri_handler(server, &ota_upload_uri);
 
         // URLs conhecidas de deteccao de captive portal (Android/iOS/Windows)
         static const char *captive_paths[] = {
@@ -3191,6 +3456,7 @@ void app_main(void)
     xTaskCreate(dns_server_task, "dns_server_task", 4096, NULL, 5, NULL);
     start_webserver();
     xTaskCreate(diag_task, "diag_task", 3072, NULL, 3, NULL);
+    ota_init();
 
     ESP_LOGI(TAG, "qqWater pronto. AP '%s' -> http://" AP_IP_ADDR_STR " | roteador -> http://<ip>/ (nome '%s')",
              AP_SSID, STA_HOSTNAME);
