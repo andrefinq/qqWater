@@ -13,5 +13,5 @@
     "--compile-commands-dir=c:\\Users\\Andre\\Documents\\GitHub\\qqWater\\build"
   ],
   "idf.flashType": "UART",
-  "idf.port": "COM6"
+  "idf.port": "COM4"
 }
