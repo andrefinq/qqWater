@@ -9,6 +9,8 @@
  * - Dois sensores de fluxo (poco e agua tratada): vazao e totalizador
  * - Atualizacao de firmware pela pagina (OTA), com volta automatica para a
  *   versao anterior se a nova falhar - ver README.md e partitions.csv
+ * - Historico de 7 dias da vazao (media a cada 10 min, gravado na flash),
+ *   com graficos, medidores e contagem de quedas de luz (hist.c, charts.js)
  * - Servidor web com 8 boteos manuais (bloqueados durante automacao)
  * - Toggle "Modo Automatico" + botao "Parar Sistema"
  * - Modulo de rele optoacoplado, ativo em HIGH
@@ -127,6 +129,10 @@
 #include "nvs.h"
 #include "driver/pulse_cnt.h"
 #include "freertos/semphr.h"
+#include "esp_netif_sntp.h"
+#include <sys/time.h>
+#include <time.h>
+#include "hist.h"
 
 static const char *TAG = "qqwater";
 
@@ -496,6 +502,169 @@ static void flow_init(void)
     }
 }
 
+// ---------------------------------------------------------------------
+// Historico de 7 dias (slots de 10 min) + relogio
+// ---------------------------------------------------------------------
+// A logica do anel esta em hist.c (testavel no PC). Aqui ficam o relogio,
+// a gravacao na NVS e o mutex.
+//
+// Relogio: real quando sincronizado por NTP (rede com internet) ou pela
+// hora do celular que abre a pagina; senao "estimado", continuando do
+// ultimo slot gravado (o tempo sem energia nao entra na conta).
+//
+// Gravacao: cada bloco de 1 dia (144 slots) e um blob de 720 bytes na NVS
+// ("hist0".."hist6") + um cabecalho. A cada 10 min so o bloco do dia e o
+// cabecalho sao regravados (~800 bytes): desgaste da flash desprezivel.
+#define CLOCK_VALID_EPOCH   1735689600LL   // 2025-01-01: abaixo disso o relogio nao foi acertado
+#define CLOCK_MAX_EPOCH     4102444800LL   // 2100-01-01
+#define HIST_HDR_MAGIC      0x51574831u    // "QWH1"
+
+typedef enum { CLOCK_ESTIMATED = 0, CLOCK_NTP, CLOCK_PHONE } clock_source_t;
+
+static hist_t hist;
+static SemaphoreHandle_t hist_mutex = NULL;
+static int64_t pseudo_base_s = 0;
+static volatile clock_source_t clock_source = CLOCK_ESTIMATED;
+static volatile bool hist_cycle_pending = false;
+
+typedef struct {
+    uint32_t magic;
+    int32_t  last;
+} hist_hdr_t;
+
+static bool clock_is_real(void)
+{
+    time_t t = time(NULL);
+    return t > CLOCK_VALID_EPOCH && t < CLOCK_MAX_EPOCH;
+}
+
+// Segundos "de calendario" atuais: reais se possivel, senao estimados.
+static int64_t clock_now_s(bool *real)
+{
+    bool r = clock_is_real();
+    if (real) *real = r;
+    if (r) return (int64_t)time(NULL);
+    return pseudo_base_s + esp_timer_get_time() / 1000000LL;
+}
+
+static void hist_save_dirty_locked(void)
+{
+    if (!hist.dirty && !hist.hdr_dirty) return;
+    nvs_handle_t h;
+    if (nvs_open("qqwater", NVS_READWRITE, &h) != ESP_OK) return;
+    static uint8_t blob[HIST_CHUNK * (2 * HIST_NSENS + 1)];
+    for (int c = 0; c < HIST_NCHUNK; c++) {
+        if (!(hist.dirty & (1u << c))) continue;
+        size_t o = 0;
+        for (int i = 0; i < HIST_NSENS; i++) {
+            memcpy(blob + o, &hist.dl[i][c * HIST_CHUNK], HIST_CHUNK * sizeof(uint16_t));
+            o += HIST_CHUNK * sizeof(uint16_t);
+        }
+        memcpy(blob + o, &hist.fl[c * HIST_CHUNK], HIST_CHUNK);
+        char key[8];
+        snprintf(key, sizeof(key), "hist%d", c);
+        nvs_set_blob(h, key, blob, sizeof(blob));
+    }
+    hist_hdr_t hdr = { .magic = HIST_HDR_MAGIC, .last = hist.last };
+    nvs_set_blob(h, "hist_hdr", &hdr, sizeof(hdr));
+    if (nvs_commit(h) == ESP_OK) {
+        hist.dirty = 0;
+        hist.hdr_dirty = false;
+    }
+    nvs_close(h);
+}
+
+static void hist_load(void)
+{
+    hist_reset(&hist);
+    nvs_handle_t h;
+    if (nvs_open("qqwater", NVS_READONLY, &h) != ESP_OK) return;
+    hist_hdr_t hdr;
+    size_t len = sizeof(hdr);
+    if (nvs_get_blob(h, "hist_hdr", &hdr, &len) == ESP_OK && len == sizeof(hdr) &&
+        hdr.magic == HIST_HDR_MAGIC) {
+        static uint8_t blob[HIST_CHUNK * (2 * HIST_NSENS + 1)];
+        for (int c = 0; c < HIST_NCHUNK; c++) {
+            char key[8];
+            snprintf(key, sizeof(key), "hist%d", c);
+            size_t bl = sizeof(blob);
+            if (nvs_get_blob(h, key, blob, &bl) != ESP_OK || bl != sizeof(blob)) continue;  // fica sem dado
+            size_t o = 0;
+            for (int i = 0; i < HIST_NSENS; i++) {
+                memcpy(&hist.dl[i][c * HIST_CHUNK], blob + o, HIST_CHUNK * sizeof(uint16_t));
+                o += HIST_CHUNK * sizeof(uint16_t);
+            }
+            memcpy(&hist.fl[c * HIST_CHUNK], blob + o, HIST_CHUNK);
+        }
+        hist.last = hdr.last;
+    }
+    nvs_close(h);
+}
+
+static void hist_init(void)
+{
+    hist_mutex = xSemaphoreCreateMutex();
+    hist_load();
+
+    // Queda de energia = religou do zero (ou subtensao). OTA, botao EN em
+    // alguns casos e erros contam como "outro reinicio".
+    esp_reset_reason_t rr = esp_reset_reason();
+    uint8_t boot_flag = (rr == ESP_RST_POWERON || rr == ESP_RST_BROWNOUT) ? HF_POWER : HF_RESET;
+    hist_start(&hist, boot_flag);
+    pseudo_base_s = (int64_t)hist_pseudo_base_slot(&hist) * HIST_SLOT_S;
+    ESP_LOGI(TAG, "Historico carregado: ultimo slot=%ld, motivo do boot=%d (%s)",
+             (long)hist.last, (int)rr, boot_flag == HF_POWER ? "queda de energia" : "reinicio");
+}
+
+// Chamada a cada 1 s pela flow_task, depois de somar os volumes.
+static void hist_second_tick(void)
+{
+    bool real;
+    int64_t now = clock_now_s(&real);
+    xSemaphoreTake(hist_mutex, portMAX_DELAY);
+    if (hist_cycle_pending) {
+        hist_cycle_pending = false;
+        hist_flag(&hist, HF_CYCLE);
+    }
+    hist_tick(&hist, (int32_t)(now / HIST_SLOT_S), real);
+    hist_save_dirty_locked();
+    xSemaphoreGive(hist_mutex);
+}
+
+// Antes de um reinicio programado (OTA): grava o slot em andamento.
+static void hist_flush_for_reboot(void)
+{
+    if (!hist_mutex) return;
+    xSemaphoreTake(hist_mutex, portMAX_DELAY);
+    hist_flush_partial(&hist);
+    hist_save_dirty_locked();
+    xSemaphoreGive(hist_mutex);
+}
+
+static void clock_sntp_synced(struct timeval *tv)
+{
+    clock_source = CLOCK_NTP;
+    ESP_LOGI(TAG, "Relogio sincronizado por NTP");
+}
+
+// Hora vinda do navegador (so usada se nao houver hora real ainda).
+static bool clock_set_from_phone(int64_t epoch)
+{
+    if (clock_is_real()) return false;
+    if (epoch <= CLOCK_VALID_EPOCH || epoch >= CLOCK_MAX_EPOCH) return false;
+    struct timeval tv = { .tv_sec = (time_t)epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    clock_source = CLOCK_PHONE;
+    ESP_LOGI(TAG, "Relogio acertado pela hora do celular");
+    return true;
+}
+
+static const char *clock_source_text(void)
+{
+    if (!clock_is_real()) return "estimado";
+    return clock_source == CLOCK_PHONE ? "celular" : "ntp";
+}
+
 // Roda a cada 1 s: le os contadores, atualiza vazao e total, grava na NVS.
 static void flow_task(void *arg)
 {
@@ -521,6 +690,7 @@ static void flow_task(void *arg)
 
             bool save_now = false;
             xSemaphoreTake(flow_mutex, portMAX_DELAY);
+            double liters = (double)delta / f->k_ppl;
             bool was_flowing = f->lpm > 0.0;
             f->pulses += (uint32_t)delta;
             f->window[f->window_pos] = (uint32_t)delta;
@@ -537,8 +707,14 @@ static void flow_task(void *arg)
             }
             xSemaphoreGive(flow_mutex);
 
+            if (liters > 0) {
+                xSemaphoreTake(hist_mutex, portMAX_DELAY);
+                hist_add(&hist, i, liters);
+                xSemaphoreGive(hist_mutex);
+            }
             if (save_now) flow_save_to_nvs(i);
         }
+        hist_second_tick();
     }
 }
 
@@ -1512,6 +1688,7 @@ static void automation_task(void *arg)
                 if (tank_high(1)) {
                     total_water_in_m3 += tank1_volume_m3;
                     total_cycles++;
+                    hist_cycle_pending = true;
                     save_totals_to_nvs();
                     enter_state(A_WAIT);
                 }
@@ -1536,6 +1713,7 @@ static void automation_task(void *arg)
                 if (tank_high(2)) {
                     total_water_in_m3 += tank2_volume_m3;
                     total_cycles++;
+                    hist_cycle_pending = true;
                     save_totals_to_nvs();
                     enter_state(B_WAIT);
                 }
@@ -1881,6 +2059,13 @@ static void net_init(void)
     netif_sta = esp_netif_create_default_wifi_sta();
     esp_netif_set_hostname(netif_sta, STA_HOSTNAME);
 
+    // Hora real pela internet quando conectado ao roteador. Sem internet o
+    // SNTP so nao sincroniza; o relogio segue estimado (ou pela hora do
+    // celular que abrir a pagina).
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    sntp_cfg.sync_cb = clock_sntp_synced;
+    esp_netif_sntp_init(&sntp_cfg);
+
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED,
                                                wifi_diag_event_handler, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
@@ -2110,6 +2295,22 @@ static const char index_html[] =
 ".wst b{color:#e8eef5;}"
 ".msg{font-size:12px;min-height:16px;margin-top:8px;color:#8ea0b3;}"
 ".bar{height:8px;border-radius:4px;background:#26313f;overflow:hidden;margin-top:10px;}"
+"#charts{display:none;max-width:420px;margin:12px auto 0;}"
+".kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;}"
+".kpi{padding:10px 8px;border-radius:10px;background:#1a232e;text-align:center;min-width:0;}"
+".kpi .h{font-size:11px;color:#8ea0b3;line-height:1.2;min-height:26px;}"
+".kpi .g{margin:4px auto 0;max-width:120px;}"
+".kpi .gv{font-size:18px;font-weight:bold;margin-top:-2px;}"
+".kpi .gs{font-size:10px;color:#8ea0b3;line-height:1.3;margin-top:4px;word-break:break-word;}"
+".kpi .big{font-size:34px;font-weight:bold;margin:12px 0 6px;color:#ef5350;}"
+".chbox{position:relative;margin-top:10px;padding:10px;border-radius:10px;background:#1a232e;}"
+".chbox .ct{font-size:12px;color:#8ea0b3;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;}"
+".chbox canvas{display:block;touch-action:pan-y;}"
+".lg span{margin-left:10px;white-space:nowrap;}"
+".lg i{display:inline-block;width:10px;height:3px;vertical-align:middle;margin-right:4px;border-radius:2px;}"
+"#chTip{display:none;position:absolute;top:34px;background:#0f1720;border:1px solid #26313f;border-radius:6px;"
+"padding:6px 8px;font-size:11px;line-height:1.5;pointer-events:none;white-space:nowrap;z-index:2;}"
+"#chNote{font-size:11px;color:#8ea0b3;margin-top:8px;line-height:1.4;}"
 ".bar div{height:100%;width:0;background:#1f9d55;transition:width .2s;}"
 ".form input[type=file]{padding:8px;font-size:12px;}"
 "</style></head><body>"
@@ -2159,6 +2360,21 @@ static const char index_html[] =
 "<button id='resetTotalsBtn' onclick='resetTotals()'>Zerar Totalizadores</button>"
 "<h2><span>Medicao de vazao</span></h2>"
 "<div class='flows' id='flows'></div>"
+"<div id='charts'>"
+"<div class='kpis'>"
+"<div class='kpi' id='gPoco'><div class='h'>Poco: medido / esperado (7 dias)</div><div class='g'></div><div class='gv'>-</div><div class='gs'></div></div>"
+"<div class='kpi'><div class='h'>Quedas de luz</div><div class='big' id='kPower'>-</div><div class='gs' id='kPowerSub'></div></div>"
+"<div class='kpi' id='gRend'><div class='h'>Rendimento do tratamento</div><div class='g'></div><div class='gv'>-</div><div class='gs'></div></div>"
+"</div>"
+"<div class='chbox'><div class='ct'><span>Vazao - ultimos 7 dias (media de 10 min)</span>"
+"<span class='lg'><span><i style='background:#4aa3ff'></i>Poco</span><span><i style='background:#2dd4bf'></i>Tratada</span>"
+"<span><i style='background:#ef5350'></i>Queda</span></span></div>"
+"<canvas id='chLine'></canvas><div id='chTip'></div></div>"
+"<div class='chbox'><div class='ct'><span>Vazao media por dia</span>"
+"<span class='lg'><span><i style='background:#4aa3ff'></i>Poco</span><span><i style='background:#2dd4bf'></i>Tratada</span></span></div>"
+"<canvas id='chBars'></canvas></div>"
+"<div id='chNote'></div>"
+"</div>"
 "<div class='grid' id='grid'></div>"
 "<h2><span>Sensores</span><span class='dbg'><label class='switch' style='width:34px;height:20px'>"
 "<input type='checkbox' id='debugToggle' onchange='toggleDebug(this.checked)'>"
@@ -2444,7 +2660,7 @@ static const char index_html[] =
 "setInterval(refresh,2000);"
 "setInterval(wifiRefresh,5000);"
 "setInterval(tickTimer,1000);"
-"</script></body></html>";
+"</script><script src='/charts.js'></script></body></html>";
 
 // ---------------------------------------------------------------------
 // Handlers HTTP
@@ -2724,6 +2940,94 @@ static esp_err_t wifi_forget_handler(httpd_req_t *req)
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
+// ---- charts.js (embutido no firmware pelo CMake: EMBED_TXTFILES) --------
+extern const char charts_js_start[] asm("_binary_charts_js_start");
+extern const char charts_js_end[]   asm("_binary_charts_js_end");
+
+static esp_err_t charts_js_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/javascript");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    // EMBED_TXTFILES acrescenta um '\0' no fim: nao enviar.
+    return httpd_resp_send(req, charts_js_start, charts_js_end - charts_js_start - 1);
+}
+
+// ---- Historico (graficos) -----------------------------------------------
+// GET /api/history: os 1008 slots dos ultimos 7 dias, do mais antigo ao
+// mais recente (o ultimo e o slot em andamento). Valores em decilitros por
+// slot de 10 min (vazao media em L/min = valor / 100).
+// {"slot_s":600,"end":<slot do ultimo>,"real":bool,"clock":"ntp|celular|estimado",
+//  "exp_m3_day":X,"purge_m3":Y,"p":[...],"t":[...],"f":[...]}
+static esp_err_t history_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+
+    // Copia sob o mutex e envia depois, para nao travar a flow_task.
+    uint16_t *dl = malloc(sizeof(uint16_t) * HIST_NSENS * HIST_N);
+    uint8_t *fl = malloc(HIST_N);
+    if (!dl || !fl) {
+        free(dl); free(fl);
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    xSemaphoreTake(hist_mutex, portMAX_DELAY);
+    int32_t end = hist_end(&hist);
+    for (int k = 0; k < HIST_N; k++) {
+        uint16_t v[HIST_NSENS];
+        hist_get(&hist, end - (HIST_N - 1) + k, v, &fl[k]);
+        for (int i = 0; i < HIST_NSENS; i++) dl[i * HIST_N + k] = v[i];
+    }
+    xSemaphoreGive(hist_mutex);
+
+    httpd_resp_set_type(req, "application/json");
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+                     "{\"slot_s\":%d,\"end\":%ld,\"real\":%s,\"clock\":\"%s\",\"exp_m3_day\":%.3f,"
+                     "\"purge_m3\":%.3f",
+                     HIST_SLOT_S, (long)end, clock_is_real() ? "true" : "false", clock_source_text(),
+                     estimated_consumed_daily_m3(), purge_volume_m3);
+    esp_err_t err = httpd_resp_send_chunk(req, buf, n);
+
+    static const char *keys[] = { "p", "t", "f" };
+    for (int arr = 0; arr < 3 && err == ESP_OK; arr++) {
+        n = snprintf(buf, sizeof(buf), ",\"%s\":[", keys[arr]);
+        for (int k = 0; k < HIST_N && err == ESP_OK; k++) {
+            unsigned v = (arr < HIST_NSENS) ? dl[arr * HIST_N + k] : fl[k];
+            n += snprintf(buf + n, sizeof(buf) - n, "%s%u", k ? "," : "", v);
+            if (n > (int)sizeof(buf) - 16) {
+                err = httpd_resp_send_chunk(req, buf, n);
+                n = 0;
+            }
+        }
+        if (err == ESP_OK) {
+            buf[n++] = ']';
+            err = httpd_resp_send_chunk(req, buf, n);
+        }
+    }
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, "}", 1);
+    if (err == ESP_OK) httpd_resp_send_chunk(req, NULL, 0);
+    free(dl);
+    free(fl);
+    return ESP_OK;
+}
+
+// POST /api/time (epoch=<segundos>): hora do celular, usada so enquanto o
+// ESP nao tem hora real (sem internet).
+static esp_err_t time_set_handler(httpd_req_t *req)
+{
+    if (!require_auth(req)) return ESP_OK;
+    char body[64], val[24];
+    bool used = false;
+    if (read_form_body(req, body, sizeof(body)) && form_value(body, "epoch", val, sizeof(val))) {
+        used = clock_set_from_phone(strtoll(val, NULL, 10));
+    }
+    char resp[64];
+    int n = snprintf(resp, sizeof(resp), "{\"used\":%s,\"clock\":\"%s\"}", used ? "true" : "false",
+                     clock_source_text());
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, resp, n);
+}
+
 // ---- Atualizacao de firmware pela rede (OTA) ---------------------------
 // Fluxo: a pagina envia o arquivo build/qqWater.bin (POST /api/ota). O
 // firmware grava na particao OTA que NAO esta rodando, confere a imagem e a
@@ -2774,6 +3078,7 @@ static void ota_task(void *arg)
                 if (flow[i].ok) flow_save_to_nvs(i);
             }
             if (state_is_resumable(auto_state)) persist_auto_state();
+            hist_flush_for_reboot();
             vTaskDelay(pdMS_TO_TICKS(500));
             esp_restart();
         }
@@ -3382,6 +3687,12 @@ static httpd_handle_t start_webserver(void)
         httpd_uri_t ota_upload_uri  = { .uri = "/api/ota",          .method = HTTP_POST, .handler = ota_upload_handler };
         httpd_register_uri_handler(server, &ota_info_uri);
         httpd_register_uri_handler(server, &ota_upload_uri);
+        httpd_uri_t history_uri     = { .uri = "/api/history",      .method = HTTP_GET,  .handler = history_handler };
+        httpd_uri_t time_uri        = { .uri = "/api/time",         .method = HTTP_POST, .handler = time_set_handler };
+        httpd_register_uri_handler(server, &history_uri);
+        httpd_register_uri_handler(server, &time_uri);
+        httpd_uri_t charts_js_uri   = { .uri = "/charts.js",        .method = HTTP_GET,  .handler = charts_js_handler };
+        httpd_register_uri_handler(server, &charts_js_uri);
 
         // URLs conhecidas de deteccao de captive portal (Android/iOS/Windows)
         static const char *captive_paths[] = {
@@ -3449,7 +3760,8 @@ void app_main(void)
     relays_init();
     boias_init();
     flow_init();
-    xTaskCreate(flow_task, "flow_task", 3072, NULL, 5, NULL);
+    hist_init();
+    xTaskCreate(flow_task, "flow_task", 4096, NULL, 5, NULL);
     xTaskCreate(boias_task, "boias_task", 3072, NULL, 5, NULL);
     xTaskCreate(automation_task, "automation_task", 4096, NULL, 5, NULL);
     net_init();
